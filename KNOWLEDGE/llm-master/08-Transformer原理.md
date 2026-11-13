@@ -1,1607 +1,1430 @@
 # 第八章：Transformer 原理——张量怎样流过一层 Block
 
-> 阅读方式：这是本章的**完整学习文件**，按知识链路合并原仓库文章。先读每节的解释与例子，再读技术细节；每节末尾闭卷做复述和闪卡。原文镜像仅供核对，不是必需的第二教材。
+阅读方式：这是本章的完整学习文件，按知识链路合并原仓库文章。先读每节的解释与例子，再读技术细节；每节末尾闭卷做复述和闪卡。原文镜像仅供核对，不是必需的第二教材。
 
 ## 本章主线
 
 从 token ID、Embedding 和位置表示开始，沿 Q/K/V→缩放点积→Mask→Softmax→多头→FFN→残差与 LayerNorm→logits 跟踪形状。每一步先说为什么需要，再写公式和维度。
 
-**本章动手证据：** 用 B=2、T=4、C=8、H=2 手写每一步形状；对两个 token 手算一次 softmax 和加权 Value；解释因果 Mask 与梯度/训练的关系。
+本章动手证据： 用 B=2、T=4、C=8、H=2 手写每一步形状；对两个 token 手算一次 softmax 和加权 Value；解释因果 Mask 与梯度/训练的关系。
 
 ## 本章目录
 
-- [8.1 为什么所有大模型都绕不开 Transformer？](#s1)
-- [8.2 Encoder-only、Decoder-only、Encoder-Decoder三种架构详解与对比](#s2)
-- [8.3 Transformer数据流动全解析：从输入文本到输出Token每一步做什么](#s3)
-- [8.4 Attention机制详解：Q、K、V是什么，为什么它是Transformer的核心](#s4)
-- [8.5 Attention计算全过程：从QK转置到Softmax加权求和一步步拆解](#s5)
-- [8.6 Multi-Head Attention详解：为什么一个头不够，多头怎么拆分和拼接](#s6)
-- [8.7 位置编码详解：Transformer为什么必须知道Token顺序，正弦编码原理](#s7)
-- [8.8 残差连接、LayerNorm、FFN：Transformer里缺一不可的配角组件](#s8)
-- [8.9 一层Transformer Block长什么样？自注意力、FFN、残差、LayerNorm拼起来](#s9)
+- 8.1 Transformer：从静态词向量到上下文表示
+
+- 8.2 Encoder、Decoder-only 与 Encoder-Decoder
+
+- 8.3 Transformer 数据流：token、隐藏态与 logits
+
+- 8.4 Q、K、V：查询、匹配与信息聚合
+
+- 8.5 Attention 计算：点积、缩放、mask 和加权
+
+- 8.6 多头注意力：形状拆分与合并
+
+- 8.7 位置编码：正弦表、RoPE 与外推
+
+- 8.8 残差、LayerNorm 与 FFN 的分工
+
+- 8.9 Transformer Block：把子层串起来
+
+- 8.10 Transformer 面试：形状、复杂度与缓存
 
 ## 与面试、代码的关系
 
-**面试串联：** 讲注意力时先给 Q/K/V 的输入输出和张量形状，再写公式；解释 Mask 在 Softmax 前加入、为何缩放 √d、FFN 与残差的作用。用一个 2-token 手算例子检验理解。
+面试串联： 讲注意力时先给 Q/K/V 的输入输出和张量形状，再写公式；解释 Mask 在 Softmax 前加入、为何缩放 √d、FFN 与残差的作用。用一个 2-token 手算例子检验理解。
 
-**需要亲手写的代码：** 闭卷写 `softmax(QKᵀ/√d + mask)V`，逐步标出 `(B,H,T,d)`、`(B,H,T,T)` 和输出 `(B,T,C)`。
+需要亲手写的代码： 闭卷写 softmax(QKᵀ/√d + mask)V，逐步标出 (B,H,T,d)、(B,H,T,T) 和输出 (B,T,C)。
+
+跨章节的需求分解、评测数据、指标与回归门禁见[系统设计与评测](横切-系统设计与评测.md)。
 
 <a id="s1"></a>
 
-## 8.1 为什么所有大模型都绕不开 Transformer？【⭐ 理解】
+## 8.1 Transformer：从静态词向量到上下文表示【🔥 必会】
+
+〔补充自原仓库镜像〕〔本次新补，参考当前面试趋势〕
 
-**一句话：** 文本经过 tokenizer 变成 token ID；Embedding 表把每个 ID 映射到 C 维向量；模型还需要位置信息，然后进入多层 Block。
+目标 + 例子。 同一个 token 的 embedding 查表结果相同，但经过注意力后，可因前文不同得到不同表示。本节用随机权重演示数据流，不解释词义，也不声称所有大模型都必须使用 Transformer。
 
-**例子：** 批量 B=2，每条序列 T=4 个 token，隐藏维 C=8。输入形状为 (2,4)，查 Embedding 后是 (2,4,8)。最后输出词表大小 V=1000 的 logits，形状为 (2,4,1000)；每个位置对应“下一个 token 各候选的分数”。
+### 概念与数据流
 
-### 一、Transformer 到底是什么？
+| 五要素 | 因果上下文化表示 |
+| --- | --- |
+| 输入 | token ID [B,T]，词表、位置容量与隐藏维 C。 |
+| 做什么 | 查 token/位置 embedding，通过因果注意力聚合可见前文，再残差与归一化。 |
+| 输出 | 每个位置的上下文表示 [B,T,C]。 |
+| 哪里出错 | token 越界、位置超长、因果 mask 反向或将随机输出解释成语义。 |
+| 参数影响 | 上下文长度、隐藏维、头数与注意力模式影响可见范围、计算和表达能力。 |
 
-先给大家一个大白话说法：
+Transformer 使用注意力等组件处理序列，训练时可并行计算多个位置；全量自注意力的分数矩阵通常随序列长度平方增长。实际模型可能采用局部、稀疏或其他注意力，也存在非 Transformer 架构；工程选型需看任务和测量结果。
 
-**Transformer 本质上就是一个巨大的函数，输入为多个x，输出为一个y。**
+### 面试追问
 
-它最核心的特点就是：
+【🔥 必会】为什么同一 token 能有不同表示？ 结论：注意力会聚合不同上下文。静态 token embedding 可以相同，经过位置表示和上下文交互后，隐藏态可不同。
 
-1. **它让序列里每个位置都能直接关注其他位置**
-2. **它可以并行训练**
-3. **它更容易被扩展到超大数据、超大参数、超大算力**
+【🔥 必会】decoder 的表示受未来 token 影响怎么办？ 结论：检查因果 mask 与输入位置。固定模型、只改未来 token，对比过去位置输出，验证允许范围。
 
-这里的“序列”，你可以先简单理解成一句话里的 token 序列。
+【⭐ 理解】Transformer 为什么适合并行训练？ 结论：多个位置的注意力可批量计算。不等于生成阶段完全并行；自回归生成仍依赖之前生成的 token。
 
-比如一句话：
+### 故障模式与排障
 
-> 我昨天在公司食堂吃饭时，突然想明白了 Transformer 为什么重要
+- 未来内容影响过去表示：检查 mask 三角方向和 API 布尔语义，用未来 token 扰动测试。
 
-对于传统模型来说，它通常得按顺序一点点往后读。  
-但 Transformer 不太一样，它会让“Transformer”这个词，在计算时直接去看“想明白了”“为什么重要”这些位置。
+- token 或位置越界：核对 tokenizer、词表和最大上下文，输入前检查范围。
 
-也就是说，它不是“一个字一个字往后传”，而更像是：
+- 把随机表示差异解释成语义理解：检查权重来源和训练状态；用真实模型与独立任务评测验证能力。
 
-> **我先把整句话都摆在桌面上，再决定每个词该重点看谁。**
+### 工程 trick 与坑
 
-这就是它后来能成为大模型底座的关键起点。
+- 下例只包含 embedding、单个注意力子层、残差和 LayerNorm，不是完整语言模型。
 
----
+- nn.MultiheadAttention 本例布尔 mask 的 True 表示屏蔽；其他 API 可能相反。
 
-### 二、为什么 RNN 不适合今天的大模型？
+- 本例无 padding、KV cache 和 tokenizer；完整手写 Block 与训练见第 9 章。
 
+### Toy code：同 token 的上下文表示
 
-![RNN处理序列信息的局限示意图](https://file1.kamacoder.com/i/algo/efd64033-a7c6-49de-9ca7-9416a9c8bc86.webp?v=20261005)
+运行前提：Python 3.10+、PyTorch；CPU 可运行，无模型下载。权重和 ID 均为随机/虚构。
 
+```python
+"""演示同一 token 在不同前文中可以得到不同上下文表示。"""
+import torch
+from torch import Tensor, nn
 
-很多初学者会先接触到 RNN、LSTM、GRU，然后自然会问：
 
-**既然 RNN 本来就是处理序列的，那为什么大模型不用它？**
+class ContextEncoder(nn.Module):
+    """玩具因果自注意力层，返回静态词向量和上下文化结果。"""
+    def __init__(self, vocab: int, channels: int, heads: int, max_len: int) -> None:
+        super().__init__()
+        if vocab < 2 or channels <= 0 or heads <= 0 or channels % heads or max_len <= 0:
+            raise ValueError('词表、维度、头数或最大长度非法')
+        self.vocab, self.max_len = vocab, max_len
+        self.token = nn.Embedding(vocab, channels)
+        self.position = nn.Embedding(max_len, channels)
+        self.attn = nn.MultiheadAttention(channels, heads, dropout=0.0, batch_first=True)
+        self.norm = nn.LayerNorm(channels)
 
+    def forward(self, ids: Tensor) -> tuple[Tensor, Tensor]:
+        """输入 (B,T) token，输出两个 (B,T,C) 表示。"""
+        if ids.ndim != 2 or ids.dtype != torch.long or ids.shape[0] == 0 or not 1 <= ids.shape[1] <= self.max_len:
+            raise ValueError('输入必须是非空且长度受限的二维 long 张量')
+        if int(ids.min()) < 0 or int(ids.max()) >= self.vocab:
+            raise ValueError('token 超出词表')
+        static = self.token(ids)
+        positions = torch.arange(ids.shape[1], device=ids.device)
+        x = static + self.position(positions)[None, :, :]
+        blocked = torch.ones(ids.shape[1], ids.shape[1], dtype=torch.bool, device=ids.device).triu(1)
+        attended, _ = self.attn(x, x, x, attn_mask=blocked, need_weights=False)
+        result = self.norm(x + attended)
+        assert result.shape == static.shape
+        return static, result
 
-#### 1. RNN 最大的问题：太依赖“按顺序处理”
 
-RNN 的思路很直观：
+def main() -> None:
+    """比较同 token 不同前文、改变未来 token 与非法输入。"""
+    torch.manual_seed(71)
+    model = ContextEncoder(vocab=16, channels=8, heads=2, max_len=8).eval()
+    ids = torch.tensor([[1, 5, 7], [2, 5, 7]], dtype=torch.long)
+    static, contextual = model(ids)
+    assert torch.equal(static[0, 1], static[1, 1])
+    assert not torch.allclose(contextual[0, 1], contextual[1, 1])
+    changed = ids.clone(); changed[:, -1] = 8
+    _, future_changed = model(changed)
+    assert torch.allclose(contextual[:, :-1], future_changed[:, :-1], atol=1e-6)
+    contextual.square().mean().backward()
+    assert model.attn.in_proj_weight.grad is not None
+    for bad in (torch.tensor([[16]]), torch.empty(1, 0, dtype=torch.long)):
+        try:
+            model(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('越界 token 或空序列必须拒绝')
+    print('同 token 上下文化与因果边界自检通过；随机权重没有语义能力。')
 
-- 先读第 1 个 token
-- 再读第 2 个 token
-- ...
-- 一直读到最后
 
-它每一步都依赖前一步的隐藏状态，所以天然就是**串行**的。
-这在小模型时代还能接受，但一旦你要训练一个几百亿、几千亿参数的大模型，问题就来了：
+if __name__ == '__main__':
+    main()
 
-**串行意味着很难把 GPU/TPU 的并行能力真正发挥。**
+```
 
+逐段理解。 ContextEncoder 查表并加入位置，使用因果多头注意力和残差；自检比较相同 token 的静态 embedding 与不同前文的输出，并检查未来扰动与梯度。
 
-#### 2. 长距离依赖容易“传着传着就弱了”
+### 这段代码怎么在面试里讲
 
-RNN 还有一个经典问题：  一句话太长时，前面的信息传到后面，容易越来越弱。
-比如这句话：
+- 不变量：ID 为 [B,T]，两种表示均为 [B,T,C]；同 token 查表值相同。
 
-> 我前天在上海参加完技术分享之后，晚上和几个做推理优化的朋友聊到凌晨，最后才真正理解，Transformer 解决的核心不是能不能做序列建模，而是能不能高效做大规模序列建模。
+- 关键过程：加入位置信息后，注意力聚合允许看到的前文；不同前文可能改变输出。
 
-如果模型想理解“Transformer”对应的是后面那一大段解释，RNN 得把前面的信息一级一级往后传。链路越长，信息越容易衰减，训练也越容易不稳定。
+- 边界与坑：随机权重仅验证计算关系，因果 mask、位置范围和真实任务表现需另行检查。
 
-#### RNN 像什么？
-像一个人拿着纸条，必须一条一条按顺序往后传。 前面传错一点，后面可能越来越模糊。
-
-所以，RNN 在“小而精”的时代很有存在感，但在“大而强”的时代，训练范式已经不占优势了。
-
----
-
-### 三、为什么 CNN 也没有成为大模型的主流底座？
-
-![Transformer并行建模长距离依赖示意图](https://file1.kamacoder.com/i/algo/a34ac634-854a-44c9-81bb-a40d66179d59.webp?v=20261005)
-
-
-那有人又会问：
-
-**CNN 不也很强吗？图像领域都统治那么久了，为什么不用 CNN 来做大模型？**
-
-#### 1. CNN 更擅长局部模式，不擅长天然建模全局关系，想看得更远，就要不断加深网络
-
-CNN 的核心是卷积核，它特别擅长提取局部特征。在图像里，这很合理。  因为边缘、纹理、局部结构，本来就很重要。但语言不太一样。
-一句话里真正重要的关系，往往不只在局部邻域里。  比如：
-
-> 我原本以为他不懂 Transformer，直到他把 Attention 的矩阵维度都手推了一遍。
-
-这里“他不懂”和“直到后面反转”之间，是全局语义关系。  CNN 如果只看局部窗口，想把这种远距离依赖建模好，往往需要堆很多层，或者设计得很复杂。
-
-#### CNN 像什么？
-像一个人拿着放大镜，每次只看局部几块区域。  想看全局，就得多看很多轮。
-
-这样当然也能做，但问题是：
-
-**Transformer 有一种更直接的方式。**
-
-它不是“我多绕几层才看到远处”，而是：
-
-> **我这一层就允许当前位置直接去看任何位置。**
-
----
-
-### 四、Transformer 克服了什么短板？
-
-既然 RNN 和 CNN 都有明显限制，那 Transformer 到底解决了什么？
-
-#### 1. 它让“长距离依赖”变得更直接
-
-在 Transformer 里，一个 token 不需要把信息一层层传很多步，它可以直接通过注意力机制，去“看”整段序列里和自己最相关的位置。
-比如句子：
-
-> 小李说他昨天终于看懂了 Transformer，因为他第一次真正理解了 Self-Attention。
-
-这里“他”到底指谁？  模型要判断，很可能需要同时参考“小李”“昨天”“看懂了 Transformer”“理解了 Self-Attention”。
-
-Transformer 的做法是：
-
-- 让“他”这个位置直接去对整句所有位置计算相关性
-- 最后把更相关的信息聚合回来
-
-这比“顺着时间一步步传”要直接得多。
-
-#### 2. 它让训练可以并行起来
-RNN 的串行方式会拖慢训练。Transformer 在训练时，可以把一整段 token 一起送进模型，同时做矩阵运算。这也意味着它天然更适合 GPU/TPU 这种擅长并行计算的硬件。
-
-而今天的大模型，本质上就是：
-
-> **架构设计 + 海量数据 + 高性能并行训练 + 工程优化**
-
-Transformer 之所以成了主流，不只是因为它“原理好”，还因为它特别符合现代计算硬件的优势。
-
-#### 3. 它更容易扩展成“大模型”
-
-一个架构要成为大模型底座，不只要“能用”，还要“能放大”。
-
-Transformer 在这方面特别适合：
-
-- 层数可以加深
-- hidden size 可以加大
-- 训练范式容易标准化
-
-#### Transformer 像什么？
-像把整段内容直接铺开在会议桌上，  
-然后每个人都可以立刻看全局，再决定自己重点参考谁。
-
-所以你会发现：
-
-> **Transformer 不是“会做序列”这么简单，而是“更适合在大规模条件下做好序列”。**
-
-这才是它真正赢下大模型时代的原因。而今天大模型最核心的关键词，恰恰就是“规模化”。
-
----
-
-### 五、为什么 BERT、GPT、T5、Llama 本质都和 Transformer 有关？
-
-这也是很多人最容易混乱的地方。
-
-它们名字完全不同，为什么都和 Transformer 有关？
-
-因为：
-
-> **它们大多不是在重新发明一套完全不同的骨架，而是在 Transformer 这个骨架上，做任务形式、训练目标、结构细节上的变化。**
-
-#### 1. BERT：Transformer 的“理解型”用法
-
-BERT 更偏向双向编码。  
-它会同时看左边和右边上下文，更擅长做理解任务，比如分类、抽取、匹配。
-
-#### 2. GPT：Transformer 的“生成型”用法
-
-GPT 则更偏向自回归生成。  
-它通常只看前文，预测下一个 token。
-
-#### 3. T5：Transformer 的“统一文本到文本”用法
-
-T5 更强调把很多任务都统一成 text-to-text。  翻译、摘要、问答，都变成“输入文本，输出文本”。
-
-#### 4. Llama：Transformer 的“现代大模型工程化升级版”
-
-Llama 看起来像新一代模型，但本质上仍然属于 Transformer 家族。
-
-它做的更多是：
-
-- 改进归一化方式
-- 改进位置编码
-- 调整训练细节
-- 提升训练效率与推理表现
-
-也就是说，Llama 不是“抛弃 Transformer”，而是：
-
-> **站在 Transformer 这套骨架上，做更适合现代大模型的优化。**
-
-所以BERT、GPT、T5、Llama 绝不是四个互不相干的名词，而是：
-
-> **它们都是 Transformer 主线上的不同分支。**
-
----
-### 六、学完这个系列你能收获什么？
-我们这个系列的写作主线将会从 Transformer 出发，逐步过渡到 BERT / T5 / GPT、MoE、Llama，再到更现代的架构辨析与核心模块手撕。同时为大家奉上常见的面试问法，也就是说，这个系列不会停留在“知道名词”，而是会尽量带你走到：
-
->**真的看懂、真的能写、真的能复现、真的能在面试时做到“从容回答”**
-
-希望能助力大家进步，多多斩获offer！
+调库与手写怎么选。 本节用库层观察上下文化；第 9 章手写注意力和 Block 以理解底层，实际应用通常使用训练好的模型。
 
 ### 本节收尾：费曼自述与闪卡
 
-**费曼自述：** “模型先把词表编号变成向量；批量、时间长度和通道数分别占一个维度，最后把通道映射成词表分数。”
+费曼自述： token 查表得到静态向量，位置与注意力使表示能结合上下文；因果模型不能让过去位置看到未来输入。
 
-**概念闪卡：** Q：B、T、C 分别表示？A：批量、序列长度、隐藏维度。Q：logits 是概率吗？A：是未归一化分数，通常再经过 softmax 才是概率。
+- 问：同 token 的 embedding 一定相同吗？答：同一张固定表中的查表结果相同。
 
-原文核对：[为什么所有大模型都绕不开 Transformer？](原仓库Markdown/docs/llm/transformer/transformer_base_1.md)。
+- 问：经过注意力后表示能不同吗？答：能，前文和位置可改变结果。
 
----
+- 问：自回归生成能完全并行吗？答：不能，后续生成依赖前面生成的 token。
+
+- 问：随机模型的表示差异证明理解语义吗？答：不证明。
+
+### 原文核对 / 来源
+
+[原仓库 Transformer 基础](原仓库Markdown/docs/llm/transformer/transformer_base_1.md)。
 
 <a id="s2"></a>
 
-## 8.2 Encoder-only、Decoder-only、Encoder-Decoder三种架构详解与对比【🔥 必会】
+## 8.2 Encoder、Decoder-only 与 Encoder-Decoder【🔥 必会】
 
-**一句话：** Encoder 侧重对输入整体编码；自回归 Decoder 每次只依赖已有前文生成下一 token；Encoder-Decoder 用编码后的输入作为条件逐步生成。
+〔补充自原仓库镜像〕〔本次新补，参考当前面试趋势〕
 
-**例子：** 读完整句子判断情绪可用 encoder 型结构；从“今天出差”续写后文要防止偷看未来 token，适合 decoder 的因果注意力；翻译是“先理解源句，再生成目标句”，常见于 encoder-decoder。现代模型有很多变体，不能仅凭名字断定内部细节。
+目标 + 例子。 对分类或文本向量任务可评估 encoder；开放式生成常用 decoder-only；翻译等输入到输出任务可评估 encoder-decoder。最终要在具体模型和数据上比较质量与成本。
 
-### 1.Encoder-only架构  
-顾名思义，Encoder-only架构为只有编码器的架构，代表性模型为BERT。这种架构更擅长“理解输入”，所以其主要应用场景为文本分类、情感分析、信息抽取、命名实体识别等。注意力矩阵采用双向注意力计算，即每个字都能看到上下文得所有信息。 以“远方有棵苹果树”这句话为例子带大家看下注意力矩阵大概的样子：
-![Encoder-only架构示意图](https://file1.kamacoder.com/i/algo/ff1a7b94-d7a5-45fc-a80b-a5bc9b80cdb9.webp?v=20261005)
+### 概念与数据流
 
-### 2.Decoder-only架构  
-Decoder-only架构为只有解码器的架构，擅长按顺序生成，适合生成类任务，也就是当今GPT（Generative Pre-trained Transformer）、Llama、Qwen、Deepseek等模型家族的主流架构，我们日常使用AI产品例如deepseek、千问、元宝、豆包等，底层往往也是这类生成式大模型。  
-这也引出一个经典面试问题：为什么生成式大模型都使用Decoder- only架构？明明这三种架构都使用自注意力机制，为什么偏偏是Decoder-only架构成了主流？  
-相信大家现在或多或少都用过一些大模型工具，不知道大家有没有注意过这些工具在生成时的特点，这些大模型都是一个字一个字往外“吐”的，更准确的说，是一个一个token逐步生成。就像我们人说话，也是一个字一个字从前往后说的，这种设计模拟了人类思维的**因果性**：我们基于已经说出口的话（前文）来推理下一个字，而不能预知未来。而我们在上篇文章中介绍的Transformer的优势之一就是：它可以让任何一个位置的Token都“注意”到其他位置的Token，也就是说，在生成一句话例如：  
-> **远方有颗苹果树**
+| 五要素 | 三类架构 |
+| --- | --- |
+| 输入 | encoder 接收源 token；decoder-only 接收上下文 token；encoder-decoder 接收源 token 和目标前缀。 |
+| 做什么 | encoder 编码上下文；decoder-only 通常因果生成；encoder-decoder 在解码时还关注编码后的源序列。 |
+| 输出 | encoder 常输出隐藏态；生成模型输出目标位置的词表 logits。 |
+| 哪里出错 | 错用 mask、混淆源与目标长度、把随机模型输出当语义能力。 |
+| 参数影响 | 序列长度、模型规模、目标任务和推理模式影响质量、延迟与资源。 |
 
-当生成到“苹果”这个词时，“树”这个词是不应该被“看见”的。即在生成当前位置的Token时，不能提前“偷看”后面的Token。  
-在Decoder-only架构中，会通过 causal mask 把“未来位置”遮住，这样便可以使大模型在生成前文时“看不到”后文。（我们后面会详细讲解自注意力矩阵的计算，大家在这里有个印象即可） 如果把注意力矩阵画出来，常见写法里被遮住的部分通常表现为上三角区域： 
-![Decoder-only架构示意图](https://file1.kamacoder.com/i/algo/2240fcb5-44c5-4fdb-877c-13139e1da48e.webp?v=20261005)
+典型 BERT encoder 在适当 mask 下编码上下文；典型 GPT 类 decoder-only 使用因果自注意力；T5 等 encoder-decoder 将源序列编码后供 decoder 跨注意力使用。这些是常见设计而非所有模型的绝对规则。Encoder 输出隐藏态并不天然等于适合检索的句向量，还需要合适的池化、训练与评测。
 
-### 3.Encoder- Decoder架构  
-即编码器-解码器架构，代表性模型为T5，适合序列到序列，文本到文本的转换任务，比如翻译、摘要、问答生成。在该架构中：  
-* Encoder阶段：使用双向注意力计算  
-* Decoder阶段采用两种注意力计算方式：  
-1. **掩码自注意力（Masked Self-Attention）**：用于处理已经生成的译文。  
-2. **交叉注意力（Cross-Attention）**：用于从编码器输出的“原文”中提取关键信息。
-![Encoder-Decoder架构示意图](https://file1.kamacoder.com/i/algo/03f4f341-dd49-44ae-8dfc-afb3d93d79ed.webp?v=20261005)
+### 面试追问
+
+【🔥 必会】三类架构怎样选？ 结论：先看任务与模型的实际能力。检索向量可评估专门训练的 encoder；生成可评估 decoder-only 或 encoder-decoder，并在同数据上测质量和成本。
+
+【🔥 必会】encoder-decoder 输出长度为什么与输入不同？ 结论：输出位置对应目标序列。源编码长度和目标前缀长度可以不同；检查 decoder 输入、cross-attention mask 和形状。
+
+【⭐ 理解】BERT 的任意隐藏态能直接当高质量 embedding 吗？ 结论：不能保证。池化方式、训练目标及领域数据影响向量质量，应在检索任务上验证。
+
+### 故障模式与排障
+
+- 输出长度不符合预期：分别检查源 token 和 decoder token 长度；按目标序列理解生成 logits。
+
+- decoder 出现未来泄漏：检查因果 mask 和模型配置；改变未来输入，验证过去 logits。
+
+- 检索向量效果差：核对模型是否针对 embedding 训练、池化和归一化；使用检索数据对比基线。
+
+### 工程 trick 与坑
+
+- 下例 encoder 返回隐藏态，另外两种返回 logits；它们的最后维度含义不同，不能直接当作能力比较。
+
+- 所有模型随机初始化，无 tokenizer、padding 或真实任务评测。
+
+- 具体模型的 attention mask、特殊 token 与输出类型以其官方文档和版本为准。
+
+### Toy code：三种随机架构的形状
+
+运行前提：Python 3.11、PyTorch、transformers==4.57.1；CPU 可运行，不下载权重。
+
+```python
+"""用随机小模型对照 encoder、decoder-only 与 encoder-decoder 形状。"""
+import torch
+from torch import Tensor
+from transformers import (BertConfig, BertModel, GPT2Config, GPT2LMHeadModel,
+                          T5Config, T5ForConditionalGeneration)
 
 
-### 三种架构的主要区别：  
-这也是初学者常常会混淆的地方，三种架构都有自注意力计算，那么区别到底在哪？ 给大家提供表格方便对比异同：
-| 架构类型 | 注意力机制特征 | 核心“超能力” | 代表模型 | 适用场景 |
-| :--- | :--- | :--- | :--- | :--- |
-| **Encoder-only (仅编码器)** | **双向注意力**：每个字都能看到上下文所有的信息，没有遮挡。 | **深刻理解**：擅长对输入文本进行精细化分析。 | BERT, RoBERTa | 情感分析、文本分类、命名实体识别、关键词提取 |
-| **Decoder-only (仅解码器)** | **单向掩码注意力**：只能看到已生成的词，不能看到未来的词（Mask）。 | **生成与推理**：擅长基于前文“吐字”，预测下一个词。 | GPT系列, Llama, DeepSeek, Claude | 聊天机器人、创意写作、逻辑推理、代码生成 |
-| **Encoder-Decoder (编码-解码器)** | **混合注意力**：Encoder看原文，Decoder边看原文边生成新内容。 | **翻译与转换**：擅长将一种序列转换为另一种序列。 | T5, BART, Transformer 原作 | 机器翻译、长文本摘要、纠错改写 |
-  
+def validate(ids: Tensor, vocab: int, max_len: int) -> None:
+    """拒绝空序列、越界 token 和超长输入。"""
+    if ids.ndim != 2 or ids.dtype != torch.long or ids.shape[0] == 0:
+        raise ValueError('输入必须是非空 (B,T) long 张量')
+    if not 1 <= ids.shape[1] <= max_len or int(ids.min()) < 0 or int(ids.max()) >= vocab:
+        raise ValueError('序列长度或 token ID 非法')
 
-  
-虽然早期三种架构并存，但现在 **Decoder-only** 几乎“统治”了 LLM 领域，是因为它在处理超大规模数据时表现出的**涌现能力**和**推理效率**更具优势。  
-  
-回到我们最初的问题：为什么生成式大模型都使用Decoder- only架构？明明这三种架构都使用自注意力机制，为什么偏偏是Decoder-only架构成了主流？  
-1. 它用了 masked self-attention，使当前位置只能看到前文。  
-2. 天然符合“根据前文预测下一个 token”的训练目标。  
-3. 大多数通用 AI 场景都能转成“给定上下文继续生成”，容易扩展。
+
+@torch.no_grad()
+def run_models(source: Tensor, target: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """构造随机小模型并返回三种架构的输出。"""
+    vocab, hidden = 24, 16
+    validate(source, vocab, 8); validate(target, vocab, 8)
+    if source.shape[0] != target.shape[0]:
+        raise ValueError('源和目标 batch 大小必须一致')
+    encoder = BertModel(BertConfig(vocab_size=vocab, hidden_size=hidden, num_hidden_layers=1,
+                                  num_attention_heads=2, intermediate_size=32)).eval()
+    decoder = GPT2LMHeadModel(GPT2Config(vocab_size=vocab, n_positions=8, n_ctx=8,
+                                         n_embd=hidden, n_layer=1, n_head=2)).eval()
+    seq2seq = T5ForConditionalGeneration(T5Config(vocab_size=vocab, d_model=hidden, d_kv=8,
+                                                  d_ff=32, num_layers=1, num_decoder_layers=1,
+                                                  num_heads=2, decoder_start_token_id=0)).eval()
+    encoded = encoder(input_ids=source).last_hidden_state
+    decoder_logits = decoder(input_ids=source).logits
+    seq2seq_logits = seq2seq(input_ids=source, decoder_input_ids=target).logits
+    assert encoded.shape == (*source.shape, hidden)
+    assert decoder_logits.shape == (*source.shape, vocab)
+    assert seq2seq_logits.shape == (*target.shape, vocab)
+    changed = source.clone(); changed[:, -1] = (changed[:, -1] + 1) % vocab
+    changed_logits = decoder(input_ids=changed).logits
+    assert torch.allclose(decoder_logits[:, :-1], changed_logits[:, :-1], atol=1e-6)
+    return encoded, decoder_logits, seq2seq_logits
+
+
+def main() -> None:
+    """检查不同目标长度、因果性和非法输入。"""
+    torch.manual_seed(67)
+    source = torch.tensor([[1, 2, 3, 4], [1, 5, 6, 7]], dtype=torch.long)
+    target = torch.tensor([[0, 8, 9], [0, 3, 4]], dtype=torch.long)
+    a, b, c = run_models(source, target)
+    assert a.shape[1] == b.shape[1] == 4 and c.shape[1] == 3
+    for bad in (torch.tensor([[24]]), torch.empty(1, 0, dtype=torch.long)):
+        try:
+            validate(bad, 24, 8)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('越界或空序列必须拒绝')
+    print('Encoder', tuple(a.shape), 'Decoder-only', tuple(b.shape), 'Encoder-decoder', tuple(c.shape))
+    print('随机模型只用于形状验证，不评估能力。')
+
+
+if __name__ == '__main__':
+    main()
+
+```
+
+逐段理解。 先验证输入；分别创建随机 BERT、GPT-2、T5；断言隐藏态和 logits 的不同形状；最后修改未来 token 检查 GPT-2 因果性。
+
+### 这段代码怎么在面试里讲
+
+- 不变量：源和目标 batch 一致；encoder 输出 [B,Tsrc,C]，生成 logits 的最后一维是词表大小。
+
+- 关键过程：encoder 编码源序列，decoder-only 对上下文输出 logits，encoder-decoder 根据源序列和目标前缀输出目标 logits。
+
+- 边界与坑：这是随机小模型的形状实验；没有 tokenizer、padding 或质量评估，不应据此比较能力。
 
 ### 本节收尾：费曼自述与闪卡
 
-**费曼自述：** “关键不是模型叫什么，而是每个位置能看哪些输入，以及输出是整体预测还是逐步生成。”
+费曼自述： Encoder 编码输入，decoder-only 通常按因果顺序生成，encoder-decoder 同时处理源序列和目标前缀；具体选型要通过任务评测。
 
-**概念闪卡：** Q：为什么 decoder 训练时需要因果 mask？A：防止当前位置看到未来答案。Q：encoder 注意力通常可看完整输入吗？A：典型双向 encoder 可以，但具体任务实现还要看 mask。
+- 问：encoder-decoder 的 logits 时间长度对应什么？答：decoder 目标前缀长度。
 
-原文核对：[Encoder-only、Decoder-only、Encoder-Decoder三种架构详解与对比](原仓库Markdown/docs/llm/transformer/transformer_base_encoder_decoder.md)。
+- 问：encoder 隐藏态天然是优质检索向量吗？答：不保证，要看训练、池化与评测。
 
----
+- 问：GPT 类模型怎样限制未来可见？答：使用因果注意力，具体按模型实现确认。
+
+- 问：本节随机模型能比较任务效果吗？答：不能，只验证接口与形状。
+
+### 原文核对 / 来源
+
+[原仓库三类架构对比](原仓库Markdown/docs/llm/transformer/transformer_base_encoder_decoder.md)。
 
 <a id="s3"></a>
 
-## 8.3 Transformer数据流动全解析：从输入文本到输出Token每一步做什么【🔥 必会】
+## 8.3 Transformer 数据流：token、隐藏态与 logits【🔥 必会】
 
-**一句话：** 文本经过 tokenizer 变成 token ID；Embedding 表把每个 ID 映射到 C 维向量；模型还需要位置信息，然后进入多层 Block。
+〔补充自原仓库镜像〕〔本次新补，参考当前面试趋势〕
 
-**例子：** 批量 B=2，每条序列 T=4 个 token，隐藏维 C=8。输入形状为 (2,4)，查 Embedding 后是 (2,4,8)。最后输出词表大小 V=1000 的 logits，形状为 (2,4,1000)；每个位置对应“下一个 token 各候选的分数”。
+目标 + 例子。 将一批 token ID 输入因果语言模型，追踪 embedding、logits 和下一 token 的训练 loss；以随机 GPT-2 检查形状与因果边界。
 
-### Word Embedding
+### 概念与数据流
 
-先给大家介绍一下Word Embedding
-（如果已经对Word Embedding有所了解，可以跳过此部分）
-计算机并不不理解“苹果”是什么，只理解数字。Word Embedding就是充当一名翻译官，把人类的自然语言翻译成计算机能理解、运算的数字。它将词映射到一个高维的语义空间中，变成高维向量：
+| 五要素 | decoder-only 数据流 |
+| --- | --- |
+| 输入 | token ID [B,T]、词表 V、上下文上限及可选 mask。 |
+| 做什么 | 查 token/位置 embedding → 经因果 Transformer 层 → 词表投影；训练时比较下一个 token。 |
+| 输出 | 隐藏态 [B,T,C]、logits [B,T,V]；有标签时可得到标量 loss。 |
+| 哪里出错 | token 越界、位置超长、标签重复移位、padding 混入 loss、mask 错误。 |
+| 参数影响 | 词表 V、上下文 T、隐藏维 C 和层数影响形状、计算及资源。 |
+
+logits 是未归一化的词表分数；经过 softmax 才得到该位置的概率分布。训练时通常并行计算每个位置预测下一 token 的 loss；推理时读取最后有效位置的 logits 选择下一个 token，循环生成。真实 tokenizer、chat template 和 padding 的处理随模型变化，下例只使用虚构 ID。
+
+### 面试追问
+
+【🔥 必会】输入到 logits 的形状怎样变化？ 结论：[B,T]→[B,T,C]→[B,T,V]。embedding 将 ID 查表变成向量，模型处理上下文，输出层映射到词表分数。
+
+【🔥 必会】训练 loss 正常但生成错位怎么查？ 结论：先核对 labels 的移位约定。检查模型是否内部移位、结束符和 padding 掩码；用短序列对照手算交叉熵。
+
+【⭐ 理解】logits 最大就是概率吗？ 结论：不是，logits 是未归一化分数。经过 softmax 才是概率；argmax 在相同温度下位置相同，但采样还受温度及截断策略影响。
+
+### 故障模式与排障
+
+- 索引越界：检查 tokenizer 与模型词表版本，以及位置长度上限；验证输入 ID 范围。
+
+- 训练目标错位：抽样打印 token 与标签，确认模型是否内部移位；不要重复右移。
+
+- 未来信息泄漏：只改未来 token，比较早期 logits；检查因果 mask 和模型模式。
+
+### 工程 trick 与坑
+
+- 本例无 padding，且所有 token 均作为语言模型标签；指令微调时哪些位置计入 loss 由目标决定，参见第 5.2 节。
+
+- GPT-2 的 labels 在本例所用接口内移位；不能把这一约定套到所有模型而不查文档。
+
+- 随机小模型用于验证形状和计算，不证明语义或语言能力。
+
+### Toy code：追踪 token 到 loss
+
+运行前提：Python 3.11、PyTorch、transformers==4.57.1；CPU 可运行，无需下载模型。
+
+```python
+"""使用随机 GPT-2 追踪 token、embedding、logits 与因果 loss。"""
+import torch
+from torch import Tensor
+from torch.nn import functional as F
+from transformers import GPT2Config, GPT2LMHeadModel
+
+
+def validate(ids: Tensor, vocab: int, max_length: int) -> None:
+    """只接收无 padding 的非空二维 long token。"""
+    if ids.ndim != 2 or ids.dtype != torch.long or ids.shape[0] == 0:
+        raise ValueError('token 必须是非空二维 long 张量')
+    if not 2 <= ids.shape[1] <= max_length:
+        raise ValueError('序列长度超出允许范围')
+    if int(ids.min()) < 0 or int(ids.max()) >= vocab:
+        raise ValueError('token 越出词表')
+
+
+@torch.no_grad()
+def trace(model: GPT2LMHeadModel, ids: Tensor) -> tuple[Tensor, Tensor]:
+    """验证 embedding、logits 和手算的 next-token loss。"""
+    validate(ids, model.config.vocab_size, model.config.n_positions)
+    model.eval()
+    embedding = model.transformer.wte(ids)
+    result = model(input_ids=ids, labels=ids, use_cache=False)
+    logits = result.logits
+    assert embedding.shape == (*ids.shape, model.config.n_embd)
+    assert logits.shape == (*ids.shape, model.config.vocab_size)
+    if result.loss is None:
+        raise RuntimeError('模型没有返回 loss')
+    manually_shifted = F.cross_entropy(logits[:, :-1, :].reshape(-1, model.config.vocab_size),
+                                      ids[:, 1:].reshape(-1))
+    assert torch.isfinite(manually_shifted) and torch.allclose(result.loss, manually_shifted, atol=1e-6)
+    return embedding, logits
+
+
+def main() -> None:
+    """检查形状、模型内部移位、因果性和非法 token。"""
+    torch.manual_seed(61)
+    config = GPT2Config(vocab_size=20, n_positions=8, n_ctx=8, n_embd=16, n_layer=1, n_head=2)
+    model = GPT2LMHeadModel(config)
+    ids = torch.tensor([[1, 4, 5, 2], [1, 7, 3, 2]], dtype=torch.long)
+    embeddings, logits = trace(model, ids)
+    changed = ids.clone(); changed[:, -1] = 9
+    _, changed_logits = trace(model, changed)
+    assert torch.allclose(logits[:, :-1], changed_logits[:, :-1], atol=1e-6)
+    next_token = logits[:, -1, :].argmax(-1)
+    assert next_token.shape == (2,) and torch.all((next_token >= 0) & (next_token < 20))
+    for bad in (torch.tensor([[20, 1]]), torch.tensor([[1]])):
+        try:
+            validate(bad, 20, 8)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('越界 ID 或过短序列必须拒绝')
+    print('token', tuple(ids.shape), 'embedding', tuple(embeddings.shape), 'logits', tuple(logits.shape))
+    print('随机模型和虚构 token 不代表真实语言能力。')
+
+
+if __name__ == '__main__':
+    main()
 
 ```
-苹果 -> [1.2, 3, 4 ………, n] 
-常见维度有512，1024
-```
 
-相似的词比如“小猫”“小狗”在这个空间中的距离就会比较近，这种“距离”，就能让计算机像人一样捕捉词之间的关系
+逐段理解。 validate 检查 token 形状与范围；trace 获取 embedding 和 logits，并用手动移位交叉熵对照模型 loss；自检改变最后 token 验证因果性。
 
----
-下面开始正文
+### 这段代码怎么在面试里讲
 
-假设输入序列为：  
-> **远方有颗苹果树**  
+- 不变量：输入 [B,T]，embedding [B,T,C]，logits [B,T,V]，token 必须处于词表内。
 
-### step1.先进行分词
-（假设词表为512维，则每个Token为1*512维的向量， 假设输入序列长L）  
-得到【远，方，有，颗，苹，果，树】（分词结果可能由于embedding模型不同而不同, 则$$L=7$$）
+- 关键过程：查表、经过模型输出 logits；将前 T-1 个位置与后 T-1 个 token 对齐计算 loss。
 
-![Transformer输入序列分词示意图](https://file1.kamacoder.com/i/web/2026-04-15_11-21-38.jpg?v=20261005)
- 
+- 边界与坑：库可能已内部移位，padding 和最后有效位置需单独处理；随机模型不具备真实语言能力。
 
-### step2. 输入文本经过embedding变成高维向量，加上位置编码  
-
-
- 
-简单介绍下位置编码：   
-* 位置编码：让模型学习到不同位置得Token可能会具有不同的语义信息，比如  
-> “你打我” 和 “我打你” 这两句话中相同的“你”“我”，位置不同，语义也不同  
-
-### step3.进入自注意力子层
-此时矩阵为$7 \times 512$：  
- step3.1 多头自注意力计算  
-step3.2 残差连接（加上自身）  
- step3.3 层归一化（配公式）  
-### step4. 进入前馈神经网络子层
-前面都在做线性变换,为了能让模型理解更深层次的信息, 在这一层会引入非线性变换
-
-step4.1 升维（假设我们要升成2048维，则乘一个$512*2048$维的向量，得到$7 \times 2048$的矩阵）  
-step4.2 经过激活函数  
-step4.3 降维（乘一个$2048\times512$维的向量，降回原矩阵大小，$7\times512$）  
-step4.4 残差连接  
-经过若干层堆叠，最后输出的矩阵仍然是$7 \times 512$维
-
-最后一步，我们需要把这 512 维映射回“词表大小”（比如 50257 维，则表示该此表有50257个词）。就像是在 5 万多个备选词里做“多选题”，看哪个词的得分最高，分数最高的，就是所预测的下一个Token，作为输出的Token，将该 Token拼接到句子末尾，就完成了一次预测。继续下一次的计算，如此循环，就是我们所看到大模型一个字一个字生成时，背后的计算原理。
+调库与手写怎么选。 本节用库观察完整数据流；从零实现注意力、Block 和训练循环见第 9 章，实际应用优先使用与 checkpoint 对齐的模型和 tokenizer。
 
 ### 本节收尾：费曼自述与闪卡
 
-**费曼自述：** “模型先把词表编号变成向量；批量、时间长度和通道数分别占一个维度，最后把通道映射成词表分数。”
+费曼自述： token ID 先变成带位置信息的向量，经因果 Transformer 得到隐藏态，再投影到词表；训练用当前位置预测下一个 token。
 
-**概念闪卡：** Q：B、T、C 分别表示？A：批量、序列长度、隐藏维度。Q：logits 是概率吗？A：是未归一化分数，通常再经过 softmax 才是概率。
+- 问：logits 的形状是什么？答：通常为 [B,T,V]。
 
-原文核对：[Transformer数据流动全解析：从输入文本到输出Token每一步做什么](原仓库Markdown/docs/llm/transformer/transformer_data_flow.md)。
+- 问：logits 是概率吗？答：不是，softmax 后才是概率。
 
----
+- 问：GPT-2 本例的 labels 要再次手工移位吗？答：不需要，模型内部已处理。
+
+- 问：随机模型能证明业务能力吗？答：不能，只用于验证计算路径。
+
+### 原文核对 / 来源
+
+[原仓库 Transformer 数据流](原仓库Markdown/docs/llm/transformer/transformer_data_flow.md)；[GPT-2 labels 文档](https://huggingface.co/docs/transformers/model_doc/gpt2)。
 
 <a id="s4"></a>
 
-## 8.4 Attention机制详解：Q、K、V是什么，为什么它是Transformer的核心【🔥 必会】
+## 8.4 Q、K、V：查询、匹配与信息聚合【🔥 必会】
 
-**一句话：** 当前 token 的 Query 与各位置 Key 比较，得到注意力分数；分数经缩放、mask、softmax 后作为权重，对各位置 Value 加权求和。
+〔补充自原仓库镜像〕〔本次新补，参考当前面试趋势〕
 
-~~~text
-Q = XWq，K = XWk，V = XWv
-score = QKᵀ / √dk
-score 加上 mask（禁止看的位置设为极小）
-weight = softmax(score)
-output = weight × V
-~~~
+目标 + 例子。 self-attention 的 Q/K/V 可以来自同一输入的不同投影；cross-attention 的 Q 可来自当前序列、K/V 来自另一序列。用不同长度的输入跟踪形状。
 
-**最小手算：** 某位置对两个可见 token 的缩放后分数为 [0, 0]，softmax 得 [0.5, 0.5]；若对应 Value 是 [2,0] 和 [0,4]，输出就是 [1,2]。分数若变为 [2,0]，第一个 token 权重更大。mask 应在 softmax 前加入，不让被遮位置分到注意力权重。
+### 概念与数据流
 
-**形状：** X=(B,T,C)；单头 Q、K、V 常为 (B,T,dₖ)；QKᵀ=(B,T,T)，表示每个位置对每个位置的分数。
+| 五要素 | Q/K/V 投影与注意力 |
+| --- | --- |
+| 输入 | query [B,Tq,C]、context [B,Tk,C] 和三组可学习投影。 |
+| 做什么 | query 投影成 Q，context 投影成 K/V；用 Q 与 K 匹配权重，再聚合 V。 |
+| 输出 | Q [B,Tq,Dk]、K [B,Tk,Dk]、V [B,Tk,Dv] 和输出 [B,Tq,Dv]。 |
+| 哪里出错 | Q/K 维度不一致、K/V 长度不一致、忽略 mask、混淆 self 与 cross 的来源。 |
+| 参数影响 | 投影维度、可见性、序列长度和权重影响表达、计算与内存。 |
 
-### 注意力的直觉解释  
-Attention本质上在做一件很像人类的事，大家先看这句话：  
-> 小明打了小刚，因为他生气了
+Q 表示当前位置用于匹配的查询，K 表示可匹配的键，V 是被加权聚合的值；这是帮助理解的类比，实际含义由训练学得。自注意力可由同一隐藏态产生三者，但投影权重通常不同；交叉注意力可让 Q 来自当前序列、K/V 来自外部上下文。本例为非因果演示；decoder 的自注意力还需要因果 mask。
 
-这里的“他”指的是谁？小明？小刚？放你看到这句话时，你不会随机回答，你会“先看一眼上下文”，再做出判断——小明。这就是Attention的直觉解释：  
-> 从上下文中，挑出和当前词最相关的部分；也就是说，**每个Token都会关注其他Token，但关注的程度不一样**
+### 面试追问
 
-### 为什么必须关注不同Token？  
-如果没有Attention机制，会发生什么？  
-1.每个词独立处理  
-2.像RNN一样顺序传递信息  
-这都会导致远距离的信息丢失，比如这句话：  
->我最近都在学习Transformer，前几天还去图书馆借了相关书籍，今天终于把Transformer学完了，它真的很强大  
+【🔥 必会】为什么 K 和 V 可以来自同一输入却不同？ 结论：它们经过不同可学习投影。K 参与匹配，V 被权重聚合；并非要求两个张量数值相同。
 
-“它”指的是谁？相关书籍？图书馆？Transformer？如果模型不能**“看整体”**，就很难捕捉到这样的语义信息  
+【🔥 必会】cross-attention 报维度错误怎么定位？ 结论：核对 Q/K 的特征维及 K/V 的序列长度。再检查 batch、mask 和投影；输出的时间长度由 query 决定。
 
-### Query，Key，Value在Attention中扮演的角色  
-大家一定也会常常听到Attention中的QKV矩阵，也是很多人搞不懂的地方：**QKV到底是做什么的？** 本篇文章依旧不涉及复杂公式，给大家形象介绍下它们的用途。  
-Query（Q）：当前Token会问所有Token一个问题：我应该**“更注意”** 谁？  
-比如这句话：
-> *远方走来的是一位身穿白裙婀娜多姿面带微笑的少女*
+【⭐ 理解】Q/K 维度必须等于 V 维度吗？ 结论：不必。点积要求 Q、K 的最后维匹配；V 的特征维可不同，输出随 V 的维度变化。
 
-这句话中，“身穿白裙”“婀娜多姿”“面带微笑”“少”等词对于“女”的语义影响是很大的，而“的”“是”等词就显得没有那么重要，于是Query矩阵就相当于“女”这个Token在发问：**我应该更关注谁？**
+### 故障模式与排障
 
-![Query Key Value角色关系示意图](https://file1.kamacoder.com/i/algo/a5d4c76f-01d3-4755-b481-cb8cfdc1a5ad.webp?v=20261005)
+- 矩阵乘法维度不匹配：分别打印 Q/K/V 形状，核对 Q/K 最后一维和 K/V 的 context 长度。
+
+- 结果与库实现不同：确认相同投影、缩放、mask 和 dropout，再用 SDPA 对照；本例无 mask。
+
+- decoder 回答泄漏未来：检查是否使用因果 mask；本节非因果演示不能直接当作 decoder 自注意力。
+
+### 工程 trick 与坑
+
+- 本例只演示单头投影，不实现 padding、因果或输出投影；完整因果实现见 9.1—9.2。
+
+- 使用同一输入产生 Q/K/V 不代表使用同一组权重；模型结构以具体实现为准。
+
+- 注意力权重不是可靠的因果解释或事实证据，模型输出仍需独立评测。
+
+### Toy code：Q/K/V 投影与 self/cross 形状
+
+运行前提：Python 3.10+、PyTorch 2.x；CPU 可运行，随机数据不代表语义。
+
+```python
+"""用线性投影和库注意力对照 self / cross attention 的 QKV 数据流。"""
+import math
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
 
 
-Key（K）：这个矩阵相当于在回答Query矩阵的问题，还是以上面这句话为例，“女”这个Token会问：我应该更关注谁？而Key矩阵则是回答：你应该更关注我。于是“身穿白裙”“婀娜多姿”“面带微笑”“少”则是回答“女”的query：**多关注我！**
+class ProjectedAttention(nn.Module):
+    """Q 来自 query，K/V 来自 context；不处理 padding。"""
+    def __init__(self, channels: int, head_dim: int, value_dim: int) -> None:
+        super().__init__()
+        if min(channels, head_dim, value_dim) <= 0:
+            raise ValueError('维度必须为正')
+        self.channels, self.head_dim, self.value_dim = channels, head_dim, value_dim
+        self.q_proj = nn.Linear(channels, head_dim, bias=False)
+        self.k_proj = nn.Linear(channels, head_dim, bias=False)
+        self.v_proj = nn.Linear(channels, value_dim, bias=False)
 
-![Attention根据QK相似度聚合Value示意图](https://file1.kamacoder.com/i/algo/42a2c5fd-ca0a-41ba-b101-7fe9679cd5b8.webp?v=20261005)
+    def forward(self, query: Tensor, context: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """输入 (B,Tq,C)/(B,Tk,C)，返回 Q、K、V 和非因果输出。"""
+        if query.ndim != 3 or context.ndim != 3 or query.shape[0] == 0 or query.shape[0] != context.shape[0]:
+            raise ValueError('输入必须是同批次非空三维张量')
+        if query.shape[1] == 0 or context.shape[1] == 0 or query.shape[2] != self.channels or context.shape[2] != self.channels:
+            raise ValueError('序列长度或通道维度非法')
+        if any(t.device != self.q_proj.weight.device or t.dtype != self.q_proj.weight.dtype or not torch.isfinite(t).all() for t in (query, context)):
+            raise ValueError('输入设备、dtype 或数值非法')
+        q, k, v = self.q_proj(query), self.k_proj(context), self.v_proj(context)
+        weights = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(self.head_dim), dim=-1)
+        out = weights @ v
+        assert out.shape == (query.shape[0], query.shape[1], self.value_dim)
+        return q, k, v, out
 
 
-Value（V）：Value 是 Token 携带的**核心特征信息**。当 Query 发现某个 Key 很匹配时，它就会把对应的 Value 提取出来，融入到当前的语义表示中
+def main() -> None:
+    """验证 self/cross 的长度、库等价和梯度。"""
+    torch.manual_seed(59)
+    model = ProjectedAttention(8, 4, 6)
+    query = torch.randn(2, 3, 8, requires_grad=True)
+    context = torch.randn(2, 5, 8, requires_grad=True)
+    q, k, v, output = model(query, context)
+    assert q.shape == (2, 3, 4) and k.shape == (2, 5, 4) and v.shape == (2, 5, 6)
+    assert torch.allclose(output, F.scaled_dot_product_attention(q, k, v, dropout_p=0.0), atol=1e-6, rtol=1e-5)
+    _, _, _, self_output = model(query, query)
+    assert self_output.shape == (2, 3, 6)
+    output.square().mean().backward()
+    assert query.grad is not None and context.grad is not None
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    try:
+        model(query.detach(), torch.randn(2, 0, 8))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('空 context 必须拒绝')
+    print('Q/K/V 投影、self/cross 形状与 SDPA 自检通过。')
+
+
+if __name__ == '__main__':
+    main()
+
+```
+
+逐段理解。 三个线性层分别生成 Q/K/V；手写权重聚合并与 SDPA 对照；同一输入演示 self、不同长度输入演示 cross；自检验证梯度和空 context。
+
+### 这段代码怎么在面试里讲
+
+- 不变量：Q/K 最后一维相同，K/V 的 context 长度相同；输出时间长度取 query。
+
+- 关键过程：分别投影并计算 softmax(QKᵀ/√Dk)V，用相同张量对照库实现。
+
+- 边界与坑：本例是非因果、无 padding 单头示例；decoder 使用时必须补正确 mask。
+
+手写与调库怎么选。 手写投影和聚合用于理解来源与形状；实际应用优先模型内置注意力，并核对具体 mask 和缓存实现。
 
 ### 本节收尾：费曼自述与闪卡
 
-**费曼自述：** “Q 像当前要找什么，K 像各位置的索引，V 是要取的信息。先比较相关性，再按权重汇总。”
+费曼自述： Q 与 K 计算匹配，权重再聚合 V。自注意力通常来自同一输入的不同投影，交叉注意力可从另一序列提供 K/V。
 
-**概念闪卡：** Q：为什么除以 √dₖ？A：控制点积分数随维度增大的尺度，避免 softmax 过度尖锐。Q：softmax 沿哪一维？A：通常沿可被关注的 key 位置维度。Q：因果 mask 应在什么时候加？A：softmax 之前。
+- 问：cross-attention 输出长度由谁决定？答：query 的长度。
 
-原文核对：[Attention机制详解：Q、K、V是什么，为什么它是Transformer的核心](原仓库Markdown/docs/llm/transformer/qkv.md)。
+- 问：Q 和 K 的最后维度为何必须相同？答：点积需要对应维度匹配。
 
----
+- 问：V 的最后维度必须与 Q 相同吗？答：不必，输出特征维由 V 决定。
+
+- 问：本例能直接用于因果 decoder 吗？答：不能，还需正确的因果和 padding mask。
+
+### 原文核对 / 来源
+
+[原仓库 Q、K、V](原仓库Markdown/docs/llm/transformer/qkv.md)。
 
 <a id="s5"></a>
 
-## 8.5 Attention计算全过程：从QK转置到Softmax加权求和一步步拆解【🔥 必会】
+## 8.5 Attention 计算：点积、缩放、mask 和加权【🔥 必会】
 
-**一句话：** 当前 token 的 Query 与各位置 Key 比较，得到注意力分数；分数经缩放、mask、softmax 后作为权重，对各位置 Value 加权求和。
+〔补充自原仓库镜像〕〔本次新补，参考当前面试趋势〕
 
-~~~text
-Q = XWq，K = XWk，V = XWv
-score = QKᵀ / √dk
-score 加上 mask（禁止看的位置设为极小）
-weight = softmax(score)
-output = weight × V
-~~~
+目标 + 例子。 用两个 token 手算一次因果注意力：第一个 token 只能看自己，第二个可以看两个位置；再对照 PyTorch SDPA。完整带 padding 的实现见第 9.1 节。
 
-**最小手算：** 某位置对两个可见 token 的缩放后分数为 [0, 0]，softmax 得 [0.5, 0.5]；若对应 Value 是 [2,0] 和 [0,4]，输出就是 [1,2]。分数若变为 [2,0]，第一个 token 权重更大。mask 应在 softmax 前加入，不让被遮位置分到注意力权重。
+### 概念与数据流
 
-**形状：** X=(B,T,C)；单头 Q、K、V 常为 (B,T,dₖ)；QKᵀ=(B,T,T)，表示每个位置对每个位置的分数。
+| 五要素 | 缩放点积注意力 |
+| --- | --- |
+| 输入 | Q、K、V，本例形状均为 [T,D]，以及因果可见性。 |
+| 做什么 | scores=QKᵀ/√D，屏蔽未来位置，逐行 softmax，再与 V 相乘。 |
+| 输出 | 注意力权重 [T,T] 和输出 [T,D]。 |
+| 哪里出错 | 矩阵转置、mask 方向、softmax 轴、全遮蔽行或指数溢出。 |
+| 参数影响 | D 决定缩放，mask 决定可见位置，序列长度 T 决定分数矩阵大小。 |
 
-### 举一个最小的例子
+示例取 Q=K=[[1,0],[0,1]]，V=[[2,0],[0,4]]。第一行只能看到第一个位置，输出 [2,0]；第二行按分数 [0,1/√2] 经 softmax 加权两个 V。数值稳定 softmax 先减去每行最大有限分数；如果一整行都被屏蔽，应显式处理，不能直接对全 -inf 求 softmax。
 
-假设输入序列是：
+### 面试追问
 
-> **我 爱 你**
+【🔥 必会】为什么 mask 要在 softmax 前处理？ 结论：让禁止位置得到零概率。对禁用位置加负无穷或使用等价实现后再归一化；还要处理整行不可见的情况。
 
-每个 Token 经过 Embedding 之后变成一个 2 维向量（真实场景里通常是 512 或 1024 维，这里用 2 维方便手算供大家理解）：
+【🔥 必会】softmax 输出 NaN 怎么排查？ 结论：先检查输入有限性和全遮蔽行。再检查数值精度、mask 和指数计算；使用稳定实现并明确空行策略。
 
-| Token | 向量 |
-|-------|------|
-| 我    | [1, 0] |
-| 爱    | [0, 1] |
-| 你    | [1, 1] |
+【⭐ 理解】为什么要除以 √D？ 结论：控制点积随维度增大的典型尺度。在常见假设下避免 softmax 过早饱和，但它不保证任何输入都数值稳定。
 
-把三行拼在一起，就得到输入矩阵 $X_{3 \times 2}$。
+### 故障模式与排障
 
-为了简化计算，我们假设 $W_Q = W_K = W_V = 单位矩阵$，所以 **Q = K = V**。
-（真实训练中这三个矩阵是不同的，是学习得来的，这里先理解流程）
+- 第一个 token 看到未来：打印允许矩阵与权重，上三角应被屏蔽；用两 token 手算和扰动测试。
 
----
+- 大分数导致 NaN：检查有限输入并使用减最大值的稳定 softmax；单独拒绝或处理全遮蔽行。
 
-### 第一步：计算 $QK^\top$（谁和谁更相关？）
+- 结果与库不一致：对齐 Q/K/V、缩放、mask、dropout、dtype 和库的布尔语义，再比较中间权重。
 
-有了 Q 和 K，我们要计算**每对 Token 之间的相关程度**。
+### 工程 trick 与坑
 
-直觉是这样的：两个向量越"相似"，它们的**内积**（点积）就越大。
+- 下例只处理没有 padding 的二维单头输入；批次、多头与 padding 的完整实现见 9.1—9.2。
 
-$$
-\text{score}(i, j) = q_i \cdot k_j^\top
-$$
+- 浮点误差要求设置合理容差；手算等式不能替代设备与真实模型下的回归。
 
-把所有 Token 两两都算一遍，就是矩阵乘法 **Q × Kᵀ**。
-Q 是 $3 \times 2$，Kᵀ 是 $2 \times 3$，结果是 **$3 \times 3$ 的分数矩阵**，每一格表示"**行 Token 对列 Token 的关注程度**"。
+- 不同 API 的布尔 mask 方向可能相反；下例用 is_causal=True 对照，不手传 bool mask 给 SDPA。
 
-手算一下：
+### Toy code：两 token 手算与库对照
 
-|   | 我 | 爱 | 你 |
-|---|----|----|-----|
-| **我** | 1  | 0  | 1  |
-| **爱** | 0  | 1  | 1  |
-| **你** | 1  | 1  | **2**  |
+运行前提：Python 3.10+、PyTorch 2.x；CPU 可运行，无网络。
 
-注意右下角那个 **2**，代表"你"和自己的相似度最高——很合理，一个 Token 和自己当然最像。
-讲到这里大家也应该明白了为什么要转置 K： 
-> Q 和 K 都是 $n \times d$ 的矩阵，形状一样没法直接相乘。
-> 把 K 转置成 $d \times n$，才能得到 $n \times n$ 的分数矩阵，每一格刚好对应一对 Token。
+```python
+"""手算两 token 的缩放因果注意力，并用 SDPA 交叉检查。"""
+import math
+import torch
+from torch import Tensor
+from torch.nn import functional as F
 
----
 
-### 第二步：缩放（为什么要除以 $\sqrt{d_k}$？）
+def stable_softmax(scores: Tensor, allowed: Tensor) -> Tensor:
+    """按行计算稳定 softmax；拒绝没有任何可见项的行。"""
+    if scores.ndim != 2 or scores.shape != allowed.shape or allowed.dtype != torch.bool or allowed.device != scores.device or not scores.is_floating_point():
+        raise ValueError('scores 与布尔 allowed 必须是相同二维形状')
+    if scores.numel() == 0 or not torch.isfinite(scores).all() or not allowed.any(dim=-1).all():
+        raise ValueError('分数必须有限且每行至少有一个可见项')
+    masked = scores.masked_fill(~allowed, float('-inf'))
+    shifted = masked - masked.max(dim=-1, keepdim=True).values
+    exp = shifted.exp()
+    weights = exp / exp.sum(dim=-1, keepdim=True)
+    assert torch.allclose(weights.sum(dim=-1), torch.ones(scores.shape[0], dtype=scores.dtype, device=scores.device))
+    return weights
 
-上一步得到的分数，可能会非常大——尤其是当向量维度 $d_k$ 很高的时候。
 
-来看个例子，假设两个 64 维的向量，每个分量都是随机数，它们的内积期望值大概是 **64 倍**于 1 维的情况。这会导致什么？
+def scaled_attention(q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+    """输入相同长度的 Q/K/V=(T,D)，只允许看到当前位置和过去。"""
+    if q.ndim != 2 or q.shape != k.shape or q.shape != v.shape or q.shape[0] == 0 or q.shape[1] == 0:
+        raise ValueError('Q/K/V 必须为同形状的非空二维张量')
+    if not q.is_floating_point() or any(x.dtype != q.dtype or x.device != q.device or not torch.isfinite(x).all() for x in (q, k, v)):
+        raise ValueError('Q/K/V 必须同设备同类型且有限')
+    length, dim = q.shape
+    allowed = torch.ones(length, length, dtype=torch.bool, device=q.device).tril()
+    weights = stable_softmax(q @ k.T / math.sqrt(dim), allowed)
+    output = weights @ v
+    assert output.shape == q.shape
+    return output, weights
 
-> 梯度就几乎消失了，模型根本学不动。
 
-解决方式很简单——除以 $\sqrt{d_k}$：
+def main() -> None:
+    """检查手算、库对照、屏蔽位置和异常输入。"""
+    q = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float64)
+    k = q.clone(); v = torch.tensor([[2.0, 0.0], [0.0, 4.0]], dtype=torch.float64)
+    output, weights = scaled_attention(q, k, v)
+    e = math.exp(1 / math.sqrt(2))
+    expected = torch.tensor([[2.0, 0.0], [2 / (1 + e), 4 * e / (1 + e)]], dtype=torch.float64)
+    library = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0)
+    assert torch.allclose(output, expected, atol=1e-10)
+    assert torch.allclose(output, library, atol=1e-10)
+    assert weights[0, 1].item() == 0.0 and torch.isfinite(output).all()
+    stable = stable_softmax(torch.tensor([[10000.0, 9999.0]]), torch.tensor([[True, True]]))
+    assert torch.isfinite(stable).all() and stable[0, 0] > stable[0, 1]
+    try:
+        stable_softmax(torch.zeros(1, 2), torch.zeros(1, 2, dtype=torch.bool))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('全遮蔽行必须拒绝')
+    print('两 token 手算、数值稳定 softmax 与 SDPA 自检通过:', output.tolist())
 
-$$
-\text{scaled score} = \frac{QK^\top}{\sqrt{d_k}}
-$$
 
-我们的例子里 $d_k = 2$，$\sqrt{2} \approx 1.41$，缩放后：
+if __name__ == '__main__':
+    main()
 
-|   | 我 | 爱 | 你 |
-|---|----|----|-----|
-| **我** | 0.71  | 0  | 0.71  |
-| **爱** | 0  | 0.71  | 0.71  |
-| **你** | 0.71  | 0.71  | **1.41**  |
+```
 
-分数被"压平"了一些，Softmax 就不会那么极端。
+逐段理解。 stable_softmax 先拒绝无效行并减去行最大值；scaled_attention 按因果可见性计算；main 对照手算公式和 SDPA，并验证大分数及全遮蔽错误。
 
----
+### 这段代码怎么在面试里讲
 
-### 第三步：Softmax（把分数变成权重）
+- 不变量：Q/K/V 为相同的 [T,D]，每个 query 至少有一个可见 key，每行权重和为 1。
 
-现在的分数还是普通数字，有正有负，我们需要把它们变成**概率**——非负，且每行加起来等于 1。
+- 关键过程：点积、缩放、遮蔽、稳定 softmax，再与 V 相乘；第一位置禁止关注未来。
 
-这正是 Softmax 做的事：
+- 边界与坑：全遮蔽行必须单独处理，浮点比较用容差；本例不支持 padding 或不同 Q/V 维度。
 
-$$
-\text{softmax}(z_i) = \frac{e^{z_i}}{\sum_j e^{z_j}}
-$$
-
-**对每一行单独做 Softmax**，以"我"这一行为例：
-
-分数：[0.71, 0, 0.71]
-
-$$
-e^{0.71} \approx 2.03, \quad e^0 = 1.00, \quad e^{0.71} \approx 2.03
-$$
-
-总和 = 5.06，归一化后：
-
-$$
-[2.03/5.06,\ 1.00/5.06,\ 2.03/5.06] \approx [0.40,\ 0.20,\ 0.40]
-$$
-
-三行全部算完，得到**注意力权重矩阵 A**：
-
-|   | 我 | 爱 | 你 |
-|---|----|----|-----|
-| **我** | 0.40  | 0.20  | 0.40  |
-| **爱** | 0.20  | 0.40  | 0.40  |
-| **你** | 0.27  | 0.27  | **0.46**  |
-
-可以验证，每行加起来都等于 1 ✅
-
-"你"关注自己的权重是 0.46，明显高于关注另外两个词（各 0.27），
-这说明 Attention 自动判断出：在当前这句话里，"你"最应该关注自己携带的信息。
-
----
-
-### 第四步：加权求和（用权重"取"出信息）
-
-最后一步，用注意力权重矩阵 A 对 V 做加权求和：
-
-$$
-\text{Output} = A \cdot V
-$$
-
-A 是 $3 \times 3$，V 是 $3 \times 2$，输出是 **$3 \times 2$**，和输入 X 同形。
-
-以"你"为例，它的权重行是 [0.27, 0.27, 0.46]，V 矩阵的三行分别是：
-
-- v₁（我）= [1, 0]
-- v₂（爱）= [0, 1]
-- v₃（你）= [1, 1]
-
-$$
-\text{out}_\text{你} = 0.27 \times [1,0] + 0.27 \times [0,1] + 0.46 \times [1,1] = [0.73,\ 0.73]
-$$
-
-"你"的输出向量 [0.73, 0.73] 是三个 Token 信息的**加权混合**，但对自身的权重更大。
-
-这就是 Attention 的本质：**每个 Token 的输出，都是全局信息的一次加权聚合**，权重由相似度决定。
-
----
-
-### 串起整个流程
-
-$$
-\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V
-$$
-
-| 步骤 | 操作 | 目的 |
-|------|------|------|
-| ① | $Q \times K^\top$ | 计算每对 Token 的相似度 |
-| ② | $\div \sqrt{d_k}$ | 防止分数过大导致梯度消失 |
-| ③ | Softmax | 把分数变成概率权重，行和为 1 |
-| ④ | × V | 按权重加权求和，聚合上下文信息 |
-
----
+手写与调库怎么选。 手算和手写用于检查因果关系与数值不变量；实际推理使用成熟注意力实现，并根据模型和设备核验 mask、精度和性能。
 
 ### 本节收尾：费曼自述与闪卡
 
-**费曼自述：** “Q 像当前要找什么，K 像各位置的索引，V 是要取的信息。先比较相关性，再按权重汇总。”
+费曼自述： Q 和 K 计算缩放分数，先屏蔽不可见位置，再对每行做稳定 softmax，最后加权 V；全遮蔽行不能直接归一化。
 
-**概念闪卡：** Q：为什么除以 √dₖ？A：控制点积分数随维度增大的尺度，避免 softmax 过度尖锐。Q：softmax 沿哪一维？A：通常沿可被关注的 key 位置维度。Q：因果 mask 应在什么时候加？A：softmax 之前。
+- 问：第一 token 的因果注意力能看哪里？答：只能看它自身及可见的更早位置。
 
-原文核对：[Attention计算全过程：从QK转置到Softmax加权求和一步步拆解](原仓库Markdown/docs/llm/transformer/qkv_cal.md)。
+- 问：为什么 softmax 前减去最大值？答：降低指数溢出风险，概率保持不变。
 
----
+- 问：全遮蔽行怎么处理？答：按系统策略明确拒绝或定义安全输出，不能默认普通 softmax 可用。
+
+- 问：权重矩阵是什么形状？答：本例是 [T,T]。
+
+### 原文核对 / 来源
+
+[原仓库 Attention 计算](原仓库Markdown/docs/llm/transformer/qkv_cal.md)；[PyTorch SDPA](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html)。
 
 <a id="s6"></a>
 
-## 8.6 Multi-Head Attention详解：为什么一个头不够，多头怎么拆分和拼接【🔥 必会】
+## 8.6 多头注意力：形状拆分与合并【🔥 必会】
 
-**一句话：** 把隐藏维分给多个头，每个头做自己的 Q/K/V 注意力，再拼接并映射回隐藏维；多头增加可学习的表示路径，但不能保证每个头天然承担固定语法角色。
+〔补充自原仓库镜像〕〔本次新补，参考当前面试趋势〕
 
-**例子：** B=2、T=4、C=8、头数 H=2，则每头 d=4。Q 可从 (2,4,8) 变成 (2,2,4,4)，维度分别是 (B,H,T,d)；注意力分数变成 (2,2,4,4)；两头输出合并回 (2,4,8)。容易错的是转置/reshape 后把 T 与 H 顺序弄反。
+目标 + 例子。 对 B=2,T=4,C=8,H=2，把隐藏态拆成 [2,2,4,4]，按头做因果注意力后拼回 [2,4,8]。完整 QKV 投影和手写多头见第 9.2 节。
 
-### 一个头有什么问题？
+### 概念与数据流
 
-先看这句话：
+| 五要素 | 多头形状变换 |
+| --- | --- |
+| 输入 | 投影后的张量 [B,T,C] 和标准 MHA 的头数 H。 |
+| 做什么 | 将通道拆成 [H,C/H]，转置得到 [B,H,T,C/H]；各头运算后逆转置并合并。 |
+| 输出 | 合并张量 [B,T,C]；完整 MHA 还需输出投影。 |
+| 哪里出错 | C 不能整除 H、时间轴与头轴混淆、非连续张量错误 reshape。 |
+| 参数影响 | 固定 C 时 H 越多，每头维度越小；实际性能和表示能力依模型及实现而定。 |
 
-> 我用筷子吃了一碗热腾腾的麻辣烫，它真的很好吃
+标准多头通常先由不同投影生成 Q/K/V，再分别拆头，头间输出拼接后通过输出投影。下例为聚焦形状，直接把同一输入当 Q/K/V，调用库注意力；它不是完整训练好的多头层。
 
-这里的"它"指的是什么？麻辣烫。
+### 面试追问
 
-但如果我问你，模型在理解这句话时，需要同时搞清楚哪些关系？
+【🔥 必会】多头拆分的具体顺序是什么？ 结论：先拆通道，再交换头与时间轴。[B,T,C]→[B,T,H,D]→[B,H,T,D]，其中 D=C/H。
 
-- "它" → "麻辣烫"（指代关系）
-- "热腾腾""麻辣烫"（修饰关系）
-- "筷子" → "吃"（工具与动作的关系）
-- "我" → "吃"（主语与动作的关系）
+【🔥 必会】输出形状正确但内容不对怎么排查？ 结论：检查 transpose 和通道顺序。用可追踪的输入验证拆分后合并能否恢复原值，再核对投影权重和 mask。
 
-这些关系是**同时存在**的，但性质完全不同。
+【⭐ 理解】多头一定让模型更好吗？ 结论：不一定。头数改变每头维度和实现效率，是否有收益要结合模型、任务与资源实验。
 
-而单头 Attention 每次只能输出一个注意力权重矩阵，相当于**从一个角度**去看整句话的关系。很难指望它同时把"指代""修饰""语法"这些完全不同的信息都捕捉到。
+### 故障模式与排障
 
-> 一个头，就像只用一种颜色的笔去批注一篇文章——你只能标出一种重点。
+- reshape 失败：检查 C%H 和实际张量形状；拒绝非法头数。
 
----
+- 形状对但 token 顺序错：用拆分/合并可逆断言检查 transpose 顺序；必要时先转为连续内存。
 
-### 多头的核心思路：让不同的头关注不同的关系
+- 未来信息泄漏：修改未来输入并检查过去输出；核对因果 mask 及 API 参数。
 
-Multi-Head Attention 的思路很直接：
+### 工程 trick 与坑
 
-**与其让一个 Attention 面面俱到，不如让多个 Attention 各司其职。**
+- 此例使用相同张量作为 Q/K/V，没有学习投影和输出投影；完整 MHA 见 9.2。
 
-每个"头"（Head）都有自己独立的 W_Q、W_K、W_V 权重矩阵，经过训练后，不同的头自然会学到不同类型的关注模式：
+- 转置后张量可能非连续；本例调用 contiguous() 再合并。
 
-- 有的头专门捕捉**短距离的语法依赖**（比如"主谓宾"）
-- 有的头专门处理**指代关系**（"它"指向谁）
-- 有的头关注**位置信息**（相邻词之间的关系）
+- GQA/MQA 的 Q 和 KV 头数可能不同，不能直接套用标准 MHA 的形状假设。
 
-这些头并行运算，最后把结果拼在一起，就能让模型同时"从多个角度"理解这句话。
+### Toy code：拆头、库注意力与合并
+
+运行前提：Python 3.10+、PyTorch 2.x；CPU 可运行，无 padding 和模型下载。
+
+```python
+"""练习多头拆分、因果注意力和合并，投影权重在第 9.2 节实现。"""
+import torch
+from torch import Tensor
+from torch.nn import functional as F
 
 
-![单头注意力关注关系示意图](https://file1.kamacoder.com/i/algo/173c684a-4950-420e-a41e-d27aa8617fa4.webp?v=20261005)
+def split_heads(x: Tensor, heads: int) -> Tensor:
+    """将 (B,T,C) 重排为 (B,H,T,C/H)，不复制通道。"""
+    if x.ndim != 3 or x.shape[0] == 0 or x.shape[1] == 0 or x.shape[2] == 0:
+        raise ValueError('输入必须为非空 (B,T,C)')
+    if isinstance(heads, bool) or not isinstance(heads, int) or heads <= 0 or x.shape[-1] % heads:
+        raise ValueError('头数必须为正且整除 C')
+    if not x.is_floating_point() or not torch.isfinite(x).all():
+        raise ValueError('输入必须为有限浮点数')
+    batch, length, channels = x.shape
+    return x.reshape(batch, length, heads, channels // heads).transpose(1, 2)
 
 
----
+def merge_heads(x: Tensor) -> Tensor:
+    """将 (B,H,T,D) 合并为 (B,T,H*D)。"""
+    if x.ndim != 4 or any(size == 0 for size in x.shape):
+        raise ValueError('输入必须为非空 (B,H,T,D)')
+    batch, heads, length, dim = x.shape
+    result = x.transpose(1, 2).contiguous().reshape(batch, length, heads * dim)
+    assert result.shape == (batch, length, heads * dim)
+    return result
 
-### 维度是怎么拆分的？
 
-这是很多初学者第一次看到多头时会懵的地方：**多头 Attention 会不会让计算量变成原来的 h 倍？**
+def main() -> None:
+    """验证拆分可逆、因果注意力形状、未来位置不影响过去和梯度。"""
+    torch.manual_seed(53)
+    x = torch.randn(2, 4, 8, requires_grad=True)
+    heads = split_heads(x, 2)
+    assert heads.shape == (2, 2, 4, 4)
+    assert torch.equal(merge_heads(heads), x)
+    output = merge_heads(F.scaled_dot_product_attention(heads, heads, heads, is_causal=True, dropout_p=0.0))
+    changed = x.detach().clone(); changed[:, -1] += 10
+    other_heads = split_heads(changed, 2)
+    other = merge_heads(F.scaled_dot_product_attention(other_heads, other_heads, other_heads,
+                                                       is_causal=True, dropout_p=0.0))
+    assert output.shape == x.shape and torch.allclose(output[:, :-1], other[:, :-1], atol=1e-6)
+    output.square().mean().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    for bad in (0, 3, True):
+        try:
+            split_heads(x.detach(), bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('错误头数必须拒绝')
+    print('多头形状、合并、因果性和梯度自检通过。')
 
-答案是：**不会**。秘密在于"维度拆分"。
 
-以 d_model = 512、h = 8 个头为例：
-
-单头 Attention 中，Q、K、V 都是 512 维。
-多头 Attention 里，每个头只用 **512 ÷ 8 = 64 维**。
-
-也就是说，不是"用 8 个完整的 Attention 再加起来"，而是**把 512 维切成 8 份，每个头负责其中一份**：
+if __name__ == '__main__':
+    main()
 
 ```
-原始 Q（n × 512）→ 切分成 8 个 Q_i（n × 64）
-原始 K（n × 512）→ 切分成 8 个 K_i（n × 64）
-原始 V（n × 512）→ 切分成 8 个 V_i（n × 64）
-```
 
-每个头在自己的 64 维子空间里做完整的 Attention 计算，输出也是 n × 64。
+逐段理解。 split_heads 检查可整除并拆头；merge_heads 恢复通道；自检用 SDPA 做因果注意力，验证拆合可逆、未来位置不影响过去和梯度有限。
 
-**总计算量和单头基本持平**，但同时"看"了 8 个不同的子空间。
+### 这段代码怎么在面试里讲
 
-![多头注意力从多个角度观察Token关系示意图](https://file1.kamacoder.com/i/algo/5678999c-0469-46eb-bfa7-dced9c8ce9c0.webp?v=20261005)
+- 不变量：输入 [B,T,C]，拆后 [B,H,T,C/H]，合并后形状和通道顺序恢复。
 
+- 关键过程：reshape 拆通道、transpose 换轴，逐头注意力后逆序操作。
 
----
+- 边界与坑：非法头数要拒绝，非连续内存需正确处理；此例没有 QKV 和输出投影。
 
-### 最后一步：拼接 + 线性变换
-
-8 个头各自算完，得到 8 个 n × 64 的输出矩阵。
-把它们**横向拼接**，就还原成 n × 512：
-
-```
-[head₁ | head₂ | ... | head₈]  →  n × 512
-```
-
-但拼接之后还没完——还要再乘一个  $W_O$（512×512）的输出投影矩阵，做一次线性变换：
-
-$$
-\text{MultiHead}(Q,K,V) = \text{Concat}(\text{head}_1, ..., \text{head}_h) \cdot W^O
-$$
-
-为什么还要乘 $W_O$？因为 8 个头各自在自己的子空间里理解信息，拼在一起之后，需要 $W_O$ 把这些信息**重新整合、混合**，让不同头学到的东西互相"对话"，输出一个统一的表示。
-
----
-
-### 整体流程一眼看清
-
-| 步骤 | 操作 | 输入 | 输出 |
-|------|------|------|------|
-| ① 线性投影 | 乘 $W_Q, W_K, W_V$ | n × 512 | n × 512（每个） |
-| ② 维度拆分 | 切成 h 份 | n × 512 | h 个 n × 64 |
-| ③ 并行 Attention | 每个头独立计算 | n × 64 | h 个 n × 64 |
-| ④ 拼接 | Concat | h 个 n × 64 | n × 512 |
-| ⑤ 输出投影 | 乘 $W_O$ | n × 512 | n × 512 |
-
-输入是 n × 512，输出还是 n × 512，**维度没有变化**，但每个 Token 的向量里已经融合了来自多个视角的上下文信息。
-
----
-
-### 小结
-
-多头 Attention 解决的核心问题，就是**一个 Attention 头"视角太单一"**。
-通过维度拆分，让多个头并行、各自在低维子空间里学习不同的关注模式，最后拼接融合，在**不增加计算量**的前提下，大幅提升了模型捕捉复杂语言关系的能力。
+手写与调库怎么选。 手写拆合帮助理解形状；生产中用成熟多头层或优化注意力实现，完整手写与权重对照见 9.2。
 
 ### 本节收尾：费曼自述与闪卡
 
-**费曼自述：** “多头不是简单把相同结果算两遍，而是有不同的可训练投影；每头在较小维度上处理，再合并。”
+费曼自述： 多头将 C 分成 H 个子空间，转置后独立计算注意力，再恢复时间轴并拼接；完整模型还需要投影。
 
-**概念闪卡：** Q：为什么 C 通常要能被 H 整除？A：要均分每头维度。Q：score 的最后两个维度是什么？A：查询位置 T 和被关注位置 T。
+- 问：C=8,H=2 时每头几维？答：4 维。
 
-原文核对：[Multi-Head Attention详解：为什么一个头不够，多头怎么拆分和拼接](原仓库Markdown/docs/llm/transformer/mha.md)。
+- 问：拆头后形状是什么？答：[B,H,T,C/H]。
 
----
+- 问：此示例是否实现完整 QKV 投影？答：没有，完整实现见 9.2。
+
+- 问：transpose 后为什么注意连续性？答：内存布局可能不连续，直接 view 可能失败或不符合预期。
+
+### 原文核对 / 来源
+
+[原仓库多头注意力](原仓库Markdown/docs/llm/transformer/mha.md)。
 
 <a id="s7"></a>
 
-## 8.7 位置编码详解：Transformer为什么必须知道Token顺序，正弦编码原理【🔥 必会】
+## 8.7 位置编码：正弦表、RoPE 与外推【🔥 必会】
 
-**一句话：** 普通自注意力对输入顺序本身缺乏充分标识，模型需要位置信息来区分相同词以不同顺序出现的序列；实现有绝对、相对、旋转等多种形式。
+〔补充自原仓库镜像〕〔本次新补，参考当前面试趋势〕
 
-**例子：** “狗追猫”与“猫追狗”词相同、顺序不同，任务答案可能完全相反。若每个 token 只有词向量而没有可用位置信号，模型难以稳定学出这种差别。仓库文章以正弦位置编码讲直觉；你在实际 GPT/VLM 中还会看到其他位置方案，不能把正弦编码当唯一标准。
+目标 + 例子。 纯自注意力本身没有显式的 token 顺序；模型需通过因果 mask、位置表示等结构利用顺序。手写正弦位置表与 RoPE，并和固定版本的 Transformers 实现对照。
 
-### 先做一个实验
+### 概念与数据流
 
-看下面这两句话：
+| 五要素 | 正弦位置表与 RoPE |
+| --- | --- |
+| 输入 | 位置索引 [T]、通道维 D；RoPE 还输入待旋转的 Q/K。 |
+| 做什么 | 正弦表生成各位置不同频率的 sin/cos 表示；RoPE 按位置旋转 Q/K 的二维分量。 |
+| 输出 | 位置表 [T,D]，或与 Q/K 同形状的旋转后张量。 |
+| 哪里出错 | 增量解码的位置偏移错误、维度配对约定不一致、超长位置数值精度或外推退化。 |
+| 参数影响 | 基频、旋转维度、上下文长度与扩展方法影响位置频率及实际长文本表现。 |
 
-> 我打了他
+正弦绝对位置表常加到 embedding 上；RoPE 通常作用于注意力的 Q、K。对同一频率的旋转，Q/K 点积具有与相对位移相关的性质，但这不保证模型在训练长度之外仍有好的效果。长上下文外推需结合具体模型的位置缩放方法、训练范围和真实任务评测。因果 mask 也引入可见范围约束，不能简单说 decoder 完全不感知顺序。
 
-> 他打了我
+### 面试追问
 
-意思完全相反，但用的是**完全一样的词**，唯一的区别是**顺序不同**。
+【🔥 必会】RoPE 为什么能表达相对位移？ 结论：两个位置旋转后的点积与角度差有关。相同频率下同时平移两个位置，角度差不变；实际模型还受其他结构与数值影响。
 
-一个好的语言模型，必须能区分这两句话。那 Transformer 能吗？
+【🔥 必会】缓存生成的结果与全量前向不同怎么查？ 结论：检查新增 token 的位置偏移。对照前缀长度、position IDs、Q/K 旋转和 mask，再用短序列验证缓存与全量输出一致。
 
----
+【⭐ 理解】RoPE 能自动保证无限长上下文吗？ 结论：不能。超出训练范围可能退化，具体扩展策略和质量须在目标模型与任务上验证。
 
-### 自注意力天然不感知顺序
+### 故障模式与排障
 
-这是 Transformer 一个反直觉的地方。
+- 增量解码重复使用位置 0：检查 cache 长度与新增 token 的 position ID；按模型接口传递正确偏移并与全量路径比较。
 
-回忆一下 Self-Attention 的计算：每个 Token 和**所有其他 Token** 做内积，算出注意力权重，再加权求和。
+- 手写与库输出不一致：核对旋转维度配对、频率、基数、位置和 dtype；本例相邻维配对，Llama 版本使用前后半维配对，需先重排。
 
-在这个过程里，**Token 的位置信息从来没有参与过计算**。
-"我"在第一位还是第三位，对 QKᵀ 的结果没有任何影响。
+- 长文本精度或效果下降：核对训练上下文、位置缩放和数值精度；用真实长度分桶评测，不能只测短序列。
 
-用一句话来说：
+### 工程 trick 与坑
 
-> Self-Attention 眼里只有"有哪些词"，没有"这些词在哪里"
+- RoPE 的具体维度排列、缩放和接口因模型、版本而异；示例仅比较固定配置下可等价转换的排列。
 
-你把输入序列的词顺序随机打乱，Self-Attention 算出来的注意力权重**完全一样**。
+- 低精度和超大位置可能带来额外误差；下面的相对位移断言只是有限位置的数学自检。
 
-这就意味着，如果什么都不做，"我打了他"和"他打了我"在 Transformer 看来是**同一句话**。
+- transformers==4.57.1 的模型内部辅助函数属于版本相关接口，升级后应重新核对。
 
+### Toy code：正弦表和 RoPE 对照
 
-### 为什么 RNN 不需要担心这个问题？
+运行前提：Python 3.11、PyTorch、transformers==4.57.1；CPU 可运行，不下载模型。示例只支持正偶数维、非负位置。
 
-你可能会想：RNN 不也是处理序列的吗，它有这个问题吗？
-
-没有。RNN 是**一个词一个词按顺序处理**的，天然把位置信息编进了隐藏状态里。第一个词处理完，才轮到第二个词，顺序是硬编码在结构里的。
-
-而 Transformer 的优势之一，恰恰是**可以并行处理所有词**——所有 Token 同时进入 Self-Attention。但代价就是：**顺序信息丢了**，需要手动补回来。
-
-
-### 解决方案：位置编码
-
-解决思路很简单：既然 Self-Attention 本身不感知位置，那就**在输入进 Attention 之前，把位置信息加进去**。
-
-具体做法是：给每个 Token 的 Embedding 向量，加上一个代表它位置的向量，这个向量就叫 **Positional Encoding（位置编码）**。
-
-$$
-\text{输入} = \text{Token Embedding} + \text{Positional Encoding}
-$$
-
-加完之后，每个 Token 的向量里就同时包含了**语义信息**（它是什么词）和**位置信息**（它在第几位）。
-
-![Transformer没有位置编码时无法区分词序示意图](https://file1.kamacoder.com/i/algo/589ad6d1-bb1a-4faa-8260-d923a2f410a9.webp?v=20261005)
+```python
+"""手写正弦位置表与成对旋转位置编码，验证形状和相对位置性质。"""
+import math
+import torch
+from torch import Tensor
+from transformers import LlamaConfig
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, apply_rotary_pos_emb
 
 
----
-
-### 位置编码长什么样？
-
-原始论文用的是**正弦和余弦函数**来生成位置编码，公式如下：
-
-$$
-PE_{(pos,\ 2i)} = \sin\left(\frac{pos}{10000^{2i/d}}\right)
-$$
-
-$$
-PE_{(pos,\ 2i+1)} = \cos\left(\frac{pos}{10000^{2i/d}}\right)
-$$
-
-我们一步步来看这两个公式。
-
----
-
-### 1.为什么用三角函数？
-
-位置编码需要满足几个条件：
-
-1. **每个位置的编码唯一**，不能有两个位置一模一样
-2. **位置之间的"距离"有规律**，相邻位置的编码应该相似，距离越远越不同
-3. **可以泛化到更长的序列**，训练时没见过的位置也能用
-
-正弦和余弦函数天然满足这几点：不同频率的波形叠加，就像一把"尺子"，每个刻度的花纹都不一样，但整体有规律。
-
-### 2.为什么不同维度用不同频率？
-
-位置编码是一个和 Token Embedding 等长的向量，比如 512 维。
-
-正弦编码的聪明之处在于：**不同维度使用不同频率的波**。
-
-- 低维度：频率高，变化快 → 区分近距离的位置（第1个词 vs 第2个词）
-- 高维度：频率低，变化慢 → 区分远距离的位置（第1个词 vs 第100个词）
-
-就好像用"秒"刻度区分相邻时刻，用"小时"刻度区分跨度更大的时间段——**不同精度的尺子，量不同尺度的距离**。
-
-![正弦位置编码不同频率变化示意图](https://file1.kamacoder.com/i/algo/ddc658ca-f85f-4cca-b5fb-b4e9bf059e5c.webp?v=20261005)
-### 3.位置编码是固定的，还是学出来的？
-
-原始 Transformer 论文用的是**固定的正弦编码**，不参与训练，直接按公式算好。
-
-但后来很多模型（比如 BERT）用的是**可学习的位置编码**——位置编码也是一组参数，和词向量一起随训练更新。
-
-两种方式在实践中效果相差不大，但各有侧重：
-
-| | 正弦编码（固定） | 可学习编码 |
-|---|---|---|
-| **参数量** | 无额外参数 | 多一组位置参数 |
-| **长序列泛化** | 理论上可以外推 | 受训练长度限制 |
-| **代表模型** | 原始 Transformer | BERT、GPT-2 |
+def angles(positions: Tensor, dim: int, base: float, dtype: torch.dtype) -> Tensor:
+    """返回 (T,D/2) 相位；此示例要求偶数维和非负位置。"""
+    if dim <= 0 or dim % 2 or not math.isfinite(base) or base <= 1:
+        raise ValueError('维度必须为正偶数，base 必须大于 1')
+    if positions.ndim != 1 or positions.numel() == 0 or positions.dtype != torch.long or (positions < 0).any():
+        raise ValueError('位置必须是非空非负的一维 long 张量')
+    exponents = torch.arange(0, dim, 2, device=positions.device, dtype=dtype) / dim
+    frequencies = base ** (-exponents)
+    return positions.to(dtype)[:, None] * frequencies[None, :]
 
 
-Transformer 用 Self-Attention 并行处理所有词，带来了速度优势，但也丢掉了顺序信息。位置编码就是用来"补"回这个信息的——在输入进 Attention 之前，把每个 Token 的位置"写"进它的向量里。
+def sinusoidal(positions: Tensor, dim: int, base: float = 10000.0) -> Tensor:
+    """构造 (T,D) 的交错 sin/cos 位置表。"""
+    phase = angles(positions, dim, base, torch.float64)
+    table = torch.stack((phase.sin(), phase.cos()), dim=-1).reshape(-1, dim)
+    assert table.shape == (positions.numel(), dim)
+    return table
 
-正弦位置编码的设计看起来复杂，本质上是一把多精度的尺子：不同维度、不同频率，共同唯一标识每个位置，还能泛化到更长的序列。
 
----
+def rope(x: Tensor, positions: Tensor, base: float = 10000.0) -> Tensor:
+    """按相邻维度旋转 x=(B,T,D)，不改变每对向量长度。"""
+    if x.ndim != 3 or x.shape[0] == 0 or x.shape[1] != positions.numel() or not x.is_floating_point():
+        raise ValueError('输入必须为浮点 (B,T,D)，且 T 匹配位置')
+    if x.device != positions.device or not torch.isfinite(x).all():
+        raise ValueError('输入与位置设备不同或输入非有限')
+    phase = angles(positions, x.shape[-1], base, x.dtype)
+    cos, sin = phase.cos().unsqueeze(0), phase.sin().unsqueeze(0)
+    even, odd = x[..., 0::2], x[..., 1::2]
+    result = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(-2)
+    assert result.shape == x.shape
+    return result
+
+
+def main() -> None:
+    """验证正弦表、旋转保范数、共同平移的点积和错误输入。"""
+    torch.manual_seed(47)
+    positions = torch.arange(4, dtype=torch.long)
+    table = sinusoidal(positions, 8)
+    assert table.shape == (4, 8) and torch.allclose(table[0, 0::2], torch.zeros(4, dtype=torch.float64))
+    q, k = torch.randn(1, 1, 8, dtype=torch.float64), torch.randn(1, 1, 8, dtype=torch.float64)
+    def dot(p: int, r: int) -> Tensor:
+        return (rope(q, torch.tensor([p])) * rope(k, torch.tensor([r]))).sum()
+    assert torch.allclose(dot(3, 8), dot(103, 108), atol=1e-10)
+    assert torch.allclose(q.norm(), rope(q, torch.tensor([3])).norm(), atol=1e-10)
+    # Llama 使用前后半维配对，本例用相邻维配对；先重排维度再对照。
+    config = LlamaConfig(hidden_size=8, num_attention_heads=1, num_key_value_heads=1,
+                         intermediate_size=16, num_hidden_layers=1, rope_theta=10000.0)
+    samples = torch.randn(1, 4, 8)
+    grouped = samples[..., [0, 2, 4, 6, 1, 3, 5, 7]].unsqueeze(1)
+    cos, sin = LlamaRotaryEmbedding(config)(grouped, positions.unsqueeze(0))
+    rotated, _ = apply_rotary_pos_emb(grouped, grouped, cos, sin)
+    restored = rotated.squeeze(1)[..., [0, 4, 1, 5, 2, 6, 3, 7]]
+    assert torch.allclose(rope(samples, positions), restored, atol=1e-6, rtol=1e-5)
+    try:
+        rope(torch.ones(1, 1, 7), torch.tensor([0]))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('奇数维示例必须拒绝')
+    try:
+        sinusoidal(torch.tensor([-1]), 8)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('负位置必须拒绝')
+    print('正弦位置、RoPE 旋转与相对位移自检通过。')
+
+
+if __name__ == '__main__':
+    main()
+
+```
+
+逐段理解。 angles 生成不同频率的相位；sinusoidal 交错放置 sin/cos；rope 对相邻维做二维旋转；自检验证保范数、共同平移点积不变，并转换维度排列后与 Llama 辅助函数比较。
+
+### 这段代码怎么在面试里讲
+
+- 不变量：输入为 [B,T,D]，D 为正偶数；输出形状不变，二维旋转保持向量范数。
+
+- 关键过程：按位置生成相位，对每对通道做旋转；Q/K 同时平移时，相位差不变。
+
+- 边界与坑：不同实现的配对布局不同；生成位置偏移、长文本缩放及浮点精度都须按模型验证。
+
+手写与调库怎么选。 手写用于理解二维旋转与相对位移；实际应用应使用目标模型内置位置实现，避免自行改变配对或缩放，代码中的库对照固定版本且不代表所有模型。
 
 ### 本节收尾：费曼自述与闪卡
 
-**费曼自述：** “词向量说‘是什么’，位置表示补充‘在什么地方’，两者一起让模型处理顺序。”
+费曼自述： 正弦表给每个位置一组不同频率的值；RoPE 根据位置旋转 Q/K，使点积与相对位移有关，但长文本表现仍需实际评测。
 
-**概念闪卡：** Q：位置编码为什么重要？A：词序影响语义与预测。Q：所有 Transformer 都使用正弦位置编码吗？A：不是。
+- 问：RoPE 通常旋转哪些张量？答：注意力中的 Q 和 K，具体实现按模型确认。
 
-原文核对：[位置编码详解：Transformer为什么必须知道Token顺序，正弦编码原理](原仓库Markdown/docs/llm/transformer/pos_encode.md)。
+- 问：相邻配对与前后半维配对可以直接比较吗？答：不能，需按布局重排并对齐频率。
 
----
+- 问：RoPE 保证无限上下文吗？答：不保证，训练范围外可能退化。
+
+- 问：缓存解码的位置从哪里开始？答：按已有前缀和模型接口确定，不能每步都从零开始。
+
+### 原文核对 / 来源
+
+[原仓库正弦位置编码](原仓库Markdown/docs/llm/transformer/pos_encode.md)；[RoFormer / RoPE 论文](https://arxiv.org/abs/2104.09864)。
 
 <a id="s8"></a>
 
-## 8.8 残差连接、LayerNorm、FFN：Transformer里缺一不可的配角组件【🔥 必会】
+## 8.8 残差、LayerNorm 与 FFN 的分工【🔥 必会】
 
-**一句话：** 注意力在位置间交换信息；FFN 对每个位置的通道做非线性变换；残差保留输入通路；LayerNorm 稳定特征尺度。
+〔补充自原仓库镜像〕〔本次新补，参考当前面试趋势〕
 
-~~~text
-一种 Pre-Norm Block 示意：
-X1 = X + Attention(LayerNorm(X))
-X2 = X1 + FFN(LayerNorm(X1))
-~~~
+目标 + 例子。 注意力聚合上下文后，FFN 逐位置变换特征，残差保留输入旁路，LayerNorm 调整特征尺度；用实验验证形状和逐位置性。
 
-**例子：** X=(2,4,8)，注意力和 FFN 的最终输出也要是 (2,4,8)，才能与残差输入相加。FFN 中间可以临时扩到更大通道，再投影回 8。Pre-Norm 与 Post-Norm 把归一化放在不同位置，读实际代码时以其实现为准。
+### 概念与数据流
 
-### 两者组合
+| 五要素 | Pre-norm FFN 残差子层 |
+| --- | --- |
+| 输入 | 隐藏态 [B,T,C]，以及归一化和 FFN 参数。 |
+| 做什么 | 对每个位置归一化，经过 FFN，再与输入相加。 |
+| 输出 | 与输入同形状的 [B,T,C]。 |
+| 哪里出错 | 归一化轴错误、残差形状不一致、混淆 FFN 与跨 token 注意力。 |
+| 参数影响 | eps、隐藏维、激活函数及归一化顺序影响数值、容量和计算。 |
 
-在 Transformer 里，残差和 LayerNorm 是**捆绑使用**的，标准写法叫 **Add & Norm**：
+Pre-norm 可写为 x + FFN(LN(x))，post-norm 可写为 LN(x + FFN(x))；二者不等价。标准 FFN 独立处理每个位置，但完整 Transformer 中注意力已经混合上下文。LayerNorm 的具体归一化维度由模型配置决定。
 
-$$
-\text{输出} = \text{LayerNorm}(x + F(x))
-$$
+### 面试追问
 
-先残差相加，再 LayerNorm 归一化，每个子模块（Self-Attention 和 FFN）后面都跟一个这样的结构。
+【🔥 必会】残差与 FFN 分别做什么？ 结论：FFN 变换特征，残差保留旁路。残差也提供直接的梯度路径，但不保证任何网络都稳定训练。
 
-![Transformer前馈网络FFN结构示意图](https://file1.kamacoder.com/i/algo/a7c59854-ed2d-4e0b-8c20-5fb9c8134955.webp?v=20261005)
+【🔥 必会】归一化结果异常怎么定位？ 结论：核对归一化维度、eps 和参数。检查输入是否有限、是否为常数以及权重偏置；对照框架层的小样本结果。
+
+【⭐ 理解】FFN 为什么不负责跨 token 交互？ 结论：标准 FFN 在每个位置独立变换。跨位置聚合由注意力等模块完成，具体以模型结构为准。
+
+### 故障模式与排障
+
+- 残差维度不匹配：打印输入和子层输出的 B/T/C，确认是否需要投影；避免依赖意外广播。
+
+- 归一化出现非有限数：检查输入、eps 和计算精度；用常数输入和框架实现对照。
+
+- 误以为 FFN 混合位置：只改变一个 token，比较其他位置的 FFN 输出；检查是否存在其他跨位置层。
+
+### 工程 trick 与坑
+
+- 示例的零均值断言只针对初始 weight=1,bias=0；训练后的缩放和平移可能改变均值与方差。
+
+- 不同模型可能使用 RMSNorm、门控 FFN 或不同残差布局；不要套用单一公式。
+
+- 本节使用框架层观察性质，手写实现与数值对照见第 9.3—9.5 节。
+
+### Toy code：观察组件性质
+
+运行前提：Python 3.10+、PyTorch；CPU 可运行。随机数据只用于不变量检查。
+
+```python
+"""观察 LayerNorm、逐位置 FFN 与残差的性质，不进行真实模型训练。"""
+import torch
+from torch import Tensor, nn
 
 
-### FFN：Self-Attention 的"搭档"，不是装饰
+class Components(nn.Module):
+    """以 pre-norm 方式将逐位置 FFN 放在残差分支中。"""
+    def __init__(self, channels: int, hidden: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        if channels <= 0 or hidden <= 0 or eps <= 0:
+            raise ValueError('维度和 eps 必须为正')
+        self.channels = channels
+        self.norm = nn.LayerNorm(channels, eps=eps)
+        self.ffn = nn.Sequential(nn.Linear(channels, hidden), nn.GELU(), nn.Linear(hidden, channels))
 
-Transformer 每一层的结构是：
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """返回归一化、FFN 输出与残差输出，形状均为 (B,T,C)。"""
+        if x.ndim != 3 or x.shape[0] == 0 or x.shape[1] == 0 or x.shape[2] != self.channels:
+            raise ValueError('输入必须为非空 (B,T,C)')
+        if x.dtype != self.norm.weight.dtype or x.device != self.norm.weight.device or not torch.isfinite(x).all():
+            raise ValueError('设备、dtype 或数值不合法')
+        normed = self.norm(x)
+        transformed = self.ffn(normed)
+        result = x + transformed
+        assert normed.shape == transformed.shape == result.shape == x.shape
+        return normed, transformed, result
+
+
+def main() -> None:
+    """验证归一化维度、逐位置性、残差关系和梯度。"""
+    torch.manual_seed(73)
+    model = Components(8, 24)
+    x = torch.randn(2, 4, 8, requires_grad=True)
+    normed, transformed, result = model(x)
+    assert torch.allclose(normed.mean(-1), torch.zeros(2, 4), atol=1e-6)
+    assert torch.allclose(result, x + transformed)
+    assert torch.allclose(model.norm(x + 10), model.norm(x), atol=2e-6)
+    changed = x.detach().clone(); changed[:, -1] += 20
+    _, other_ffn, _ = model(changed)
+    assert torch.allclose(transformed[:, :-1], other_ffn[:, :-1], atol=1e-6)
+    result.square().mean().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert all(p.grad is not None for p in model.parameters())
+    for bad in (torch.empty(0, 4, 8), torch.randn(1, 4, 7)):
+        try:
+            model(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('空输入或错误维度必须拒绝')
+    print('LayerNorm、FFN 逐位置性、残差与梯度自检通过。')
+
+
+if __name__ == '__main__':
+    main()
 
 ```
-Self-Attention → Add & Norm → FFN → Add & Norm
-```
 
-Self-Attention 负责让 Token 之间"互通信息"，FFN 负责什么？
+逐段理解。 Components 组合 LayerNorm、FFN 和残差；自检检查初始化时的均值、平移不变性、逐位置性以及梯度。
 
-很多初学者觉得 FFN 就是两层普通的线性变换，可有可无。但它其实在做一件 Self-Attention 做不了的事：**对每个 Token 的向量做非线性变换，提取更深层的特征。**
+### 这段代码怎么在面试里讲
 
-FFN 的结构很简单：
+- 不变量：输入、归一化结果、FFN 结果和残差结果都为 [B,T,C]。
 
-$$
-\text{FFN}(x) = \text{ReLU}(x \cdot W_1 + b_1) \cdot W_2 + b_2
-$$
+- 关键过程：先按最后一维归一化，再逐位置经过 FFN，最后与原输入相加。
 
-两层线性变换，中间夹一个激活函数（ReLU 或 GELU）。
-
-关键细节：**FFN 会先升维，再降维。**
-
-以 d_model = 512 为例：
-
-```
-输入 x（512维）
-    ↓ × W₁（512→2048）
-中间层（2048维）← 升维到 4 倍
-    ↓ 激活函数
-    ↓ × W₂（2048→512）
-输出（512维）
-```
-
-
-### 为什么要先升维再降维？
-
-这里藏着 FFN 最重要的设计思路。
-
-Self-Attention 做的是**线性组合**——把不同 Token 的 Value 向量加权求和，本质上是线性变换。**线性变换叠加再多层，表达能力还是有限的。**
-
-FFN 中间插入了激活函数，带来了**非线性**。先升维，是为了在更高维的空间里让激活函数"发挥作用"——高维空间里，非线性能捕捉到更复杂的特征组合。再降维，把提取到的信息压缩回原来的维度，传给下一层。
-
-
-还有一点值得注意：**FFN 是对每个 Token 独立计算的**，不同 Token 之间不共享中间结果。
-
-这和 Self-Attention 正好相反——Self-Attention 让所有 Token 互相"看"，FFN 让每个 Token 自己"想"。
-
-| | Self-Attention | FFN |
-|---|---|---|
-| **处理方式** | Token 之间互相交互 | 每个 Token 独立处理 |
-| **变换类型** | 线性（加权求和） | 非线性（含激活函数） |
-| **作用** | 聚合上下文信息 | 深化单个 Token 的表示 |
-
-两者一个负责"横向"（Token 间）的信息交流，一个负责"纵向"（特征维度）的深度加工，缺一不可。
-
-
-这三者各有分工，但都不可少：
-
-- **残差连接**：给梯度留一条高速公路，让深层网络能够正常训练
-- **LayerNorm**：每层计算完之后做数值体检，防止数值爆炸影响下一层
-- **FFN**：补上 Self-Attention 缺少的非线性能力，让每个 Token 的表示更丰富
-
-把这三个加上 Self-Attention，一个完整的 Transformer Encoder 层就搭好了。
-
----
+- 边界与坑：零均值断言依赖初始参数；残差不保证收敛，不同模型的归一化和 FFN 可能不同。
 
 ### 本节收尾：费曼自述与闪卡
 
-**费曼自述：** “注意力让 token 互相交流，FFN 在每个 token 内进一步加工；残差给原信息留路，归一化让训练更稳定。”
+费曼自述： LayerNorm 按指定特征维处理数值，FFN 在每个位置变换特征，残差保留输入旁路；具体顺序由模型设计决定。
 
-**概念闪卡：** Q：FFN 是否负责跨 token 通信？A：典型位置前馈层逐位置作用，跨位置交流主要来自注意力。Q：残差相加的形状要求？A：相同或可按设计兼容。
+- 问：标准 FFN 混合不同 token 吗？答：不混合，它逐位置变换。
 
-原文核对：[残差连接、LayerNorm、FFN：Transformer里缺一不可的配角组件](原仓库Markdown/docs/llm/transformer/ffn_ln.md)。
+- 问：pre-norm 与 post-norm 相同吗？答：不相同，归一化和相加的顺序不同。
 
----
+- 问：LayerNorm 最终输出总是零均值吗？答：不一定，可学习缩放和平移会改变结果。
+
+- 问：残差保证训练一定稳定吗？答：不保证，还受模型和训练配置影响。
+
+### 原文核对 / 来源
+
+[原仓库 FFN 与 LayerNorm](原仓库Markdown/docs/llm/transformer/ffn_ln.md)。
 
 <a id="s9"></a>
 
-## 8.9 一层Transformer Block长什么样？自注意力、FFN、残差、LayerNorm拼起来【🔥 必会】
+## 8.9 Transformer Block：把子层串起来【🔥 必会】
+
+〔补充自原仓库镜像〕〔本次新补，参考当前面试趋势〕
 
-**一句话：** 注意力在位置间交换信息；FFN 对每个位置的通道做非线性变换；残差保留输入通路；LayerNorm 稳定特征尺度。
+目标 + 例子。 把注意力、FFN、残差和 LayerNorm 串成一个因果 pre-norm block；用框架层观察数据流，并通过未来扰动验证因果性。
 
-~~~text
-一种 Pre-Norm Block 示意：
-X1 = X + Attention(LayerNorm(X))
-X2 = X1 + FFN(LayerNorm(X1))
-~~~
+### 概念与数据流
 
-**例子：** X=(2,4,8)，注意力和 FFN 的最终输出也要是 (2,4,8)，才能与残差输入相加。FFN 中间可以临时扩到更大通道，再投影回 8。Pre-Norm 与 Post-Norm 把归一化放在不同位置，读实际代码时以其实现为准。
+| 五要素 | 因果 pre-norm Block |
+| --- | --- |
+| 输入 | 隐藏态 [B,T,C] 和有效 token 标记 [B,T]。 |
+| 做什么 | 归一化→因果多头注意力→残差，再归一化→FFN→残差。 |
+| 输出 | [B,T,C]；本例额外将无效 query 位置清零。 |
+| 哪里出错 | 默认库层并非因果、掩码方向错误、padding 泄漏、子层与残差维度不匹配。 |
+| 参数影响 | 头数、FFN 宽度、dropout、归一化顺序和序列长度影响计算与行为。 |
 
-### 一、自注意力子层
+注意力子层聚合允许位置的信息，FFN 对各位置独立变换特征。下面用 TransformerEncoderLayer 配合显式因果 mask 演示结构；这不是完整 decoder，也不包含位置编码、词表投影、交叉注意力或 KV cache。完整手写实现与权重对照见第 9.5 节。
 
-#### 先回顾一下自注意力机制
+### 面试追问
 
-上=前几篇文章提到，Transformer 最核心的能力之一，是让每个 token 都能"直接看到"整个序列里其他位置。
+【🔥 必会】pre-norm Block 如何计算？ 结论：每个子层先归一化，再与旁路相加。先注意力子层和残差，再 FFN 子层和残差；具体结构仍要看模型实现。
 
-自注意力机制（Self-Attention）就是完成这件事的核心模块。
+【🔥 必会】库层运行正常却出现未来泄漏怎么查？ 结论：检查是否显式设置因果可见性。用相同输入只改变未来位置，比较过去输出，再核对库的 mask 语义。
 
-还是用这句话举例：
+【⭐ 理解】此处的 encoder 层就是完整 decoder 吗？ 结论：不是。它仅在显式因果 mask 等配置下可演示相似自注意力 block；完整模型还包含其他必要组件。
 
-> **远方有颗苹果树**
+### 故障模式与排障
 
-当模型在计算"苹果"这个词的表示时，自注意力机制会让它去衡量：
-- "苹果"和"树"有多相关？
-- "苹果"和"远方"有多相关？
-- "苹果"和"有"有多相关？
+- 未来 token 影响过去：核对 src_mask、布尔方向及位置维，用扰动测试定位。
 
-最后把所有位置的信息按相关程度**加权聚合**，得到"苹果"这个词更丰富的表示。
+- padding 干扰有效结果：检查 key padding mask、序列真实长度和输出处理；无效位置的 loss 也需屏蔽。
 
-#### 多头注意力：多角度看问题
+- 数值或梯度异常：检查输入有限性、dtype、设备与维度；逐子层对照并检查梯度。
 
-实际上，Transformer 不只用一组注意力，而是同时用**多组**，这就是"多头注意力"（Multi-Head Attention）。
+### 工程 trick 与坑
 
-为什么要多头？
-一个词和其他词的关系，往往不止一种维度。比如"苹果"和"树"的关系，可能既有"苹果是树上长的"这层语义，又有"苹果和树位置相邻"这层结构信息。
+- TransformerEncoderLayer 默认不是自回归解码器；示例手动传入上三角禁止 mask。
 
-单头注意力每次只能学一种关系模式。多头注意力，则相当于同时派出多个"分析员"，每个人从不同角度去看词与词的关系，最后把所有分析结果拼起来。
+- 示例只支持右侧 padding、固定配置和无 dropout；实际模型的 mask、norm 和缓存可能不同。
 
-> 多头注意力 = 多个注意力头并行计算 + 结果拼接 + 线性变换
+- 生产中优先使用与模型权重一致的实现；手写 block 和库参数对照见第 9.5 节。
 
-假设有 8 个注意力头，每个头负责不同的语义维度，最后把 8 个结果拼在一起，再做一次线性映射，输出和输入维度保持一致。
-![Transformer Block前向过程示意图](https://file1.kamacoder.com/i/algo/IMG_0415_1806.WEBP?v=20261005)
+### Toy code：框架 Block 的因果边界
 
+运行前提：Python 3.10+、PyTorch 2.x；CPU 可运行，随机输入没有业务语义。
 
----
+```python
+"""观察配置为因果 pre-norm 的框架 Block，不等同完整 decoder。"""
+import torch
+from torch import Tensor, nn
 
-### 二、残差连接：把原来的自己加回来
 
-自注意力算完之后，不是直接把结果往下传，而是要先做一个操作：
+class CausalBlock(nn.Module):
+    """封装一个无 dropout 的库层并处理右侧 padding 输出。"""
+    def __init__(self, channels: int, heads: int, hidden: int) -> None:
+        super().__init__()
+        if min(channels, heads, hidden) <= 0 or channels % heads:
+            raise ValueError('维度必须为正且通道数能被头数整除')
+        self.channels = channels
+        self.layer = nn.TransformerEncoderLayer(d_model=channels, nhead=heads, dim_feedforward=hidden,
+                                                dropout=0.0, activation='gelu', batch_first=True,
+                                                norm_first=True)
 
-**把输出和输入相加。**
+    def forward(self, x: Tensor, valid: Tensor) -> Tensor:
+        """输入 (B,T,C) 与右侧 padding 标记，输出同形状。"""
+        if x.ndim != 3 or x.shape[0] == 0 or x.shape[1] == 0 or x.shape[-1] != self.channels:
+            raise ValueError('输入必须为非空 (B,T,C)')
+        if valid.shape != x.shape[:2] or valid.dtype != torch.bool or valid.device != x.device:
+            raise ValueError('valid 必须为同设备 (B,T) bool')
+        if not valid[:, 0].all() or ((~valid[:, :-1]) & valid[:, 1:]).any():
+            raise ValueError('只支持非空和右侧 padding')
+        weight = self.layer.self_attn.in_proj_weight
+        if x.dtype != weight.dtype or x.device != weight.device or not torch.isfinite(x).all():
+            raise ValueError('输入设备、dtype 或数值非法')
+        blocked = torch.ones(x.shape[1], x.shape[1], dtype=torch.bool, device=x.device).triu(1)
+        output = self.layer(x, src_mask=blocked, src_key_padding_mask=~valid)
+        result = output * valid.unsqueeze(-1)
+        assert result.shape == x.shape
+        return result
 
-用公式表示就是：
 
-$$\text{输出} = \text{Self-Attention}(x) + x$$
+def main() -> None:
+    """检查因果性、padding、梯度和非法形状。"""
+    torch.manual_seed(79)
+    block = CausalBlock(8, 2, 24).eval()
+    x = torch.randn(2, 4, 8, requires_grad=True)
+    valid = torch.tensor([[True, True, True, True], [True, True, False, False]])
+    output = block(x, valid)
+    changed = x.detach().clone(); changed[:, -1] += 50
+    assert torch.allclose(output[:, :-1], block(changed, valid)[:, :-1], atol=1e-6)
+    assert torch.count_nonzero(output[1, 2:]).item() == 0
+    output.square().mean().backward()
+    assert block.layer.self_attn.in_proj_weight.grad is not None
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    try:
+        block(torch.randn(2, 4, 7), valid)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('通道错误必须拒绝')
+    print('框架 Block 的形状、因果性、padding 和梯度自检通过。')
 
-这就是**残差连接**（Residual Connection）为什么要这样做？
 
+if __name__ == '__main__':
+    main()
 
-这样做有两个好处：
+```
 
-1. **防止信息丢失**：哪怕注意力层没学到什么有用的东西，至少原始输入还保留着，不会越传越"面目全非"。
-2. **解决深层网络训练难题**：网络层数很深时，梯度容易消失。残差连接提供了一条"快速通道"，让梯度可以直接流回较早的层，训练更稳定。
+逐段理解。 CausalBlock 构造 pre-norm 库层并传入因果及 padding mask；自检验证输出形状、未来扰动、无效输出和梯度。
 
-> **残差连接 = 原始输入 + 子层输出**
+### 这段代码怎么在面试里讲
 
----
+- 不变量：输入输出均 [B,T,C]，通道数可被头数整除，序列非空且右侧 padding。
 
-### 三、层归一化：把数值拉回合理范围
+- 关键过程：显式传因果 mask 和 key padding mask，运行注意力/FFN 两个残差子层并清零无效输出。
 
-残差连接之后，紧接着是**层归一化**（Layer Normalization，简称 LayerNorm）。
-
-归一化的直觉是：经过多次矩阵运算，数值可能跑得很大或很小，分布变得很不稳定。LayerNorm 的作用，是把每一层的输出**重新拉回到均值为 0、方差为 1 附近的分布**，让后续计算更稳定。
-
-把残差连接和层归一化合起来，这一步完整写出来是：
-
-$$x' = \text{LayerNorm}(x + \text{Self-Attention}(x))$$
-
-注意：现代很多大模型（比如 Llama）改成了 **Pre-LayerNorm**，也就是先归一化再送入子层，效果往往更稳定，我们后续文章会详细讲。
-
----
-
-### 四、前馈神经网络子层：引入非线性理解
-
-自注意力子层完成后，数据进入第二个子层：**前馈神经网络**（Feed-Forward Network，FFN）。
-
-上一篇文章提到，自注意力本质上是在做**线性变换**，也就是对序列中的各个位置进行加权组合。
-
-但只有线性变换，模型的"理解能力"其实是有上限的——很多复杂的语义模式，线性变换捕捉不了。
-
-FFN 的存在，就是为了引入**非线性**，让模型能学到更深层次的语义信息。
-
-FFN 的结构很简单，三步走：
-
-**第一步：升维**
-
-把维度从 512 升到 2048（通常是 4 倍），乘一个大矩阵。
-
-$$h = W_1 x + b_1 \quad (512 \to 2048)$$
-
-**第二步：激活函数**
-
-引入非线性，常用 ReLU 或 GELU。
-
-$$h = \text{GELU}(h)$$
-
-**第三步：降维**
-
-再乘一个矩阵，把维度从 2048 降回 512。
-
-$$\text{输出} = W_2 h + b_2 \quad (2048 \to 512)$$
-
-> **FFN = 先升维 → 激活 → 再降维**
-
-这个"先升维再降维"的设计，让模型能够去捕捉非线性特征，然后再压缩回来继续传递。
-
-FFN 结束后，同样要做一次残差连接 + 层归一化：
-
-$$x'' = \text{LayerNorm}(x' + \text{FFN}(x'))$$
-
----
-
-### 五、一层 Block 的完整前向过程
-
-现在把所有步骤串起来，一层 Transformer Block 的前向过程如下：
-
-**输入**：矩阵 $x$，形状为 $[L \times d]$（L 为序列长度，d 为向量维度）
-
-**第一步：自注意力子层**
-
-$$x' = \text{LayerNorm}(x + \text{MultiHead-Attention}(x))$$
-
-**第二步：前馈神经网络子层**
-
-$$x'' = \text{LayerNorm}(x' + \text{FFN}(x'))$$
-
-**输出**：矩阵 $x''$，形状仍为 $[L \times d]$
-
-注意关键点：**输入和输出的维度完全一致**。这意味着可以把很多层 Block 串联起来，一层接一层，最终形成深层网络。这也是 Transformer 能轻松"堆深"的原因之一。
-
----
-
-### 本阶段小结
-
-一层 Transformer Block，本质上就是两个子层的叠加：
-
-- **自注意力子层**：让 token 之间互相"交流"，聚合全局信息
-- **前馈神经网络子层**：对每个 token 独立做深层非线性变换
-
-两个子层都由相同的外壳包裹：
-
-> **子层输出 → 残差连接 → 层归一化**
-
-这套组合，简洁、稳定、可扩展，是 Transformer 能被堆到几十上百层的根本原因。
-
-下一篇文章我们将开启一个新阶段：从理解到手撕 Transformer，争取带大家开始真正“从零实现”,可以点下关注不迷路~
+- 边界与坑：库 encoder 层只是结构对照，不能替代完整 decoder；还需位置、缓存和具体模型的 mask。
 
 ### 本节收尾：费曼自述与闪卡
 
-**费曼自述：** “注意力让 token 互相交流，FFN 在每个 token 内进一步加工；残差给原信息留路，归一化让训练更稳定。”
+费曼自述： Block 将注意力和 FFN 与归一化、残差组合，形状前后保持一致；因果性依赖正确的可见性约束。
 
-**概念闪卡：** Q：FFN 是否负责跨 token 通信？A：典型位置前馈层逐位置作用，跨位置交流主要来自注意力。Q：残差相加的形状要求？A：相同或可按设计兼容。
+- 问：此例 block 的输入输出形状？答：都是 [B,T,C]。
 
-原文核对：[一层Transformer Block长什么样？自注意力、FFN、残差、LayerNorm拼起来](原仓库Markdown/docs/llm/transformer/transformer_structure.md)。
+- 问：默认 encoder 层一定因果吗？答：不是，示例显式传入 mask。
 
----
+- 问：padding query 如何处理？答：本例将对应输出清零，训练时还要处理 loss。
 
-## 面试专题：把概念串成项目回答
+- 问：完整模型是否还需要位置表示？答：通常需要具体模型设计的位置机制。
 
-以下材料已整合在本章，不需跳到原仓库另找。先用自己的项目经验回答，再看参考结构。
+### 原文核对 / 来源
 
-### 8.10 Transformer大厂面试题汇总：应用开发者视角
+[原仓库 Transformer Block](原仓库Markdown/docs/llm/transformer/transformer_structure.md)。
 
-### 目录
+<a id="s10"></a>
 
-1. 为什么应用开发也要懂 Transformer？
-2. 为什么所有大模型都绕不开 Transformer？
-3. Self-Attention：Transformer 的灵魂
-4. Multi-Head Attention：为什么要多个头？
-5. Positional Encoding：为什么位置信息这么重要？
-6. Encoder vs Decoder vs Decoder-Only：三大架构怎么选？
-7. Transformer 的局限性
-8. 面试高频问题汇总
+## 8.10 Transformer 面试：形状、复杂度与缓存【🔥 必会】
 
----
+〔补充自原仓库镜像〕〔本次新补，参考当前面试趋势〕
 
-### 1. 为什么应用开发也要懂 Transformer？
+目标 + 例子。 面试时先给输入输出和形状，再解释因果 mask、位置、计算与缓存；用小张量核对理论字节数，避免把公式当实际显存监控。
 
-面试官问 Transformer，不是要你推导 QKV 矩阵乘法，是看你对**大模型的底层逻辑有没有理解**。
+### 概念与数据流
 
-用大模型做开发，这几个问题你一定遇到过：
+| 五要素 | 注意力与 KV cache 粗算 |
+| --- | --- |
+| 输入 | 层数 L、批次 B、查询头 Hq、KV 头 Hkv、序列长度 T、头维 D 和每元素字节数。 |
+| 做什么 | 估算一层完整注意力分数 [B,Hq,T,T] 与各层 K/V [2,L,B,Hkv,T,D] 的理论大小。 |
+| 输出 | 两个理论字节数；它们不是实际峰值显存。 |
+| 哪里出错 | GQA 使用错误头数、混淆单层与所有层、遗漏 dtype、误以为优化实现一定物化分数矩阵。 |
+| 参数影响 | T 加倍时完整分数张量元素数变四倍，KV 元素数变两倍；实际开销还取决于实现和调度。 |
 
-- **Token 怎么计费的？** 为什么一次交互消耗几万 Token？这和 Transformer 的计算方式直接相关
-- **上下文窗口为什么有上限？** GPT-4 是 128K，Claude Opus 是 200K，为什么不能无限长？这和 Transformer 的复杂度有关
-- **为什么模型会"忘记"前面的内容？** 长对话到后面，模型对开头的信息越来越模糊，这和注意力机制有关
-- **为什么 Prompt 结构化比大段文字效果好？** 这和多注意力头的分工机制有关
+全量注意力的逻辑分数矩阵规模与 T² 有关，但优化后的 attention 内核可能不完整物化该矩阵；不能直接把理论张量大小当作显存峰值。KV 粗算也不含模型权重、激活、对齐、碎片、共享和元数据；详细缓存边界见第 6.2 节。
 
-不了解 Transformer，这些问题你只能靠经验去猜。了解了，你就知道**背后的原因，也能更科学地优化**。
+### 面试追问
 
-**面试怎么说**："我理解 Transformer 的核心机制，包括自注意力、多头注意力、位置编码。
+【🔥 必会】多头 attention 的分数形状？ 结论：标准自注意力为 [B,H,T,T]。Q/K 每头维度为 D，点积沿 D 收缩；cross-attention 的两个序列长度可不同。
 
-这些理解帮助我在实际开发中更好地管理上下文、优化 Prompt、控制 Token 成本——不是停留在'会用 API'的层面。"
+【🔥 必会】长上下文推理 OOM 怎么定位？ 结论：区分权重、KV 和运行时开销。记录并发、上下文、KV 头数和 dtype；用实际显存监控和小规模实验验证粗算。
 
----
+【⭐ 理解】GQA 的缓存量按哪个头数算？ 结论：按 KV 头数计算。查询头可能多于 KV 头；本例假设两者可整除，具体结构要核对模型。
 
-### 2. 为什么所有大模型都绕不开 Transformer？
+### 故障模式与排障
 
-面试官喜欢问："为什么 GPT、Claude、Gemini、LLaMA 全都用 Transformer？有没有替代方案？"
+- 估算远小于实际显存：检查是否漏掉模型权重、激活、对齐、碎片和额外缓冲；用框架或服务监控实测。
 
-这个问题要从 Transformer 之前说起。
+- GQA 缓存估得过大：核对查询头数与 KV 头数；缓存公式使用实际 KV 头数。
 
-#### Transformer 之前：RNN 和 CNN 的困境
+- 理论分数矩阵很大但实测显存较低：检查使用的 attention 后端；优化实现可能分块计算而不完整存储分数矩阵。
 
-**RNN（循环神经网络）** 的致命问题：
+### 工程 trick 与坑
 
-- **梯度消失**：序列越长，前面的信息传到后面就越弱。处理 1000 个 Token 的文本，第 1 个 Token 的梯度信号到第 1000 步基本没了。这就是为什么 RNN 记不住长距离依赖
-- **串行计算**：RNN 必须一个 Token 一个 Token 地处理，第 2 个 Token 必须等第 1 个处理完。没法并行，训练速度上不去
+- 示例估算一层分数和所有层 KV，口径不同且不能直接相加为总峰值。
 
-**CNN（卷积神经网络）** 的问题：
+- 相同层形状、统一 dtype 和完整上下文是简化假设；滑窗、分层配置和分布式切分需要分别计算。
 
-- **局部感受野**：CNN 天然只能看到局部窗口内的信息，想看全局就得堆很多层。堆层数又带来训练难度
-- **长距离依赖弱**：两个相隔很远的词之间的关系，CNN 很难捕捉到
+- 测真实服务时同时记录延迟、吞吐与失败率，参见第 6.4 节。
 
-#### Transformer 的解法：注意力机制
+### Toy code：理论张量字节数
 
-Transformer 用注意力机制一步到位解决了这两个问题：
+运行前提：Python 3.10+、PyTorch；CPU 上用小张量核对公式，不测 GPU 峰值显存。
 
-- **不需要逐步传递信息**：每个 Token 直接和所有其他 Token 计算相关性，不需要像 RNN 那样一步步传。第 1 个 Token 和第 1000 个 Token 的关系，一步就能算出来
-- **可以并行计算**：所有 Token 的注意力可以同时算，不用串行等待。GPU 最擅长这种大规模并行运算
+```python
+"""计算注意力分数和 KV cache 的理论张量字节数，不等于峰值显存。"""
+from dataclasses import dataclass
+import torch
 
-**一句话：RNN 记不住长距离关系，CNN 看不到全局，Transformer 用注意力一步搞定，还能并行。**
 
-![RNN vs Transformer](https://file1.kamacoder.com/i/web/1778232931.png?v=20261005)
+@dataclass(frozen=True)
+class Dimensions:
+    """统一层数、批次、查询头、KV 头、序列长度和头维度。"""
+    layers: int
+    batch: int
+    query_heads: int
+    kv_heads: int
+    tokens: int
+    head_dim: int
+    bytes_per_element: int
 
-#### 有替代方案吗？
 
-有，但目前都没能替代 Transformer：
+def estimate(d: Dimensions) -> dict[str, int]:
+    """估计单层完整注意力分数张量与全部层 K/V 张量的字节数。"""
+    values = (d.layers, d.batch, d.query_heads, d.kv_heads, d.tokens, d.head_dim, d.bytes_per_element)
+    if any(isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in values):
+        raise ValueError('所有维度和字节数必须为正整数')
+    if d.query_heads % d.kv_heads:
+        raise ValueError('此示例的 GQA 要求查询头数是 KV 头数的整数倍')
+    scores = d.batch * d.query_heads * d.tokens * d.tokens * d.bytes_per_element
+    cache = 2 * d.layers * d.batch * d.kv_heads * d.tokens * d.head_dim * d.bytes_per_element
+    return {'single_layer_attention_score_bytes': scores, 'all_layer_kv_bytes': cache}
 
-- **Mamba（状态空间模型）**：推理速度快，长序列有优势，但生成质量和通用性还比不上 Transformer
-- **RWKV**：结合了 RNN 和 Transformer 的优点，但生态还不成熟
-- **混合架构**：部分层用 Transformer，部分层用其他结构，目前还在探索阶段
 
-面试不用展开太多，关键是说清楚一点：**Transformer 在并行计算和全局建模之间找到了最好的平衡，目前还没有架构能在通用性和性能上同时超越它。**
+def main() -> None:
+    """用真实小张量核对字节数，并检查 GQA 与非法维度。"""
+    dims = Dimensions(layers=2, batch=2, query_heads=4, kv_heads=2,
+                      tokens=3, head_dim=4, bytes_per_element=4)
+    result = estimate(dims)
+    scores = torch.empty(dims.batch, dims.query_heads, dims.tokens, dims.tokens, dtype=torch.float32)
+    kv = torch.empty(2, dims.layers, dims.batch, dims.kv_heads, dims.tokens, dims.head_dim, dtype=torch.float32)
+    assert result['single_layer_attention_score_bytes'] == scores.numel() * scores.element_size()
+    assert result['all_layer_kv_bytes'] == kv.numel() * kv.element_size()
+    longer = estimate(Dimensions(2, 2, 4, 2, 6, 4, 4))
+    assert longer['single_layer_attention_score_bytes'] == 4 * result['single_layer_attention_score_bytes']
+    assert longer['all_layer_kv_bytes'] == 2 * result['all_layer_kv_bytes']
+    for bad in (Dimensions(1, 1, 3, 2, 4, 4, 4), Dimensions(1, 1, 2, 2, 0, 4, 4)):
+        try:
+            estimate(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('错误头数或长度必须拒绝')
+    print('理论张量字节数自检通过:', result)
+    print('没有测量实际峰值显存；优化注意力实现可能不物化分数矩阵。')
+
+
+if __name__ == '__main__':
+    main()
 
-**面试怎么说**："Transformer 之前，RNN 有梯度消失和串行计算的问题，CNN 有局部感受野的局限。
-
-Transformer 的注意力机制让每个 Token 能直接和所有其他 Token 建立关系，而且可以并行计算，这是它取代 RNN 和 CNN 的核心原因。
-
-目前有 Mamba 等替代方案在探索，但通用性和生态都还差一截。"
-
----
-
-### 3. Self-Attention：Transformer 的灵魂
-
-面试官会问："Self-Attention 是什么？为什么说它是 Transformer 的核心？"
-
-#### 一句话理解 Self-Attention
-
-**Self-Attention 就是让每个词去看它和其他所有词的关系，然后根据关系远近决定关注多少。**
-
-举个经典例子："银行"这个词，在"我去银行存钱"和"我在河边的银行散步"里意思完全不同。Self-Attention 做的就是——根据上下文里其他词的信息，动态调整"银行"这个词的表示。
-
-在"存钱"旁边的"银行"是金融机构，在"河边"旁边的"银行"是河岸。**词的意思不是固定的，是由上下文决定的。**
-
-#### Q、K、V 是什么？
-
-面试官最爱问这个。但别去背公式，说清楚逻辑就行。
-
-Self-Attention 用三个矩阵把每个 Token 映射成三个向量：
-
-- **Q（Query）**：我在找什么？——当前词想知道自己和谁有关系
-- **K（Key）**：我有什么？——每个词能提供什么信息
-- **V（Value）**：我的内容是什么？——每个词的实际信息
-
-拿"我去银行存钱"举例：
-
-- "银行"的 Q 去问：谁和我有关系？
-- "存钱"的 K 回答：和我有关系！
-- "河边"的 K 回答：和我没关系
-- 然后根据关系远近加权，把"存钱"的 V 拿过来，更新"银行"的表示
-
-**Q 找对象，K 判断匹不匹配，V 提供实际内容。** 这就是 Self-Attention 的核心逻辑。
-
-![Self-Attention QKV 流程](https://file1.kamacoder.com/i/web/1778232933.png?v=20261005)
-
-#### 对应用开发的启示
-
-**为什么上下文质量决定了输出质量？**
-
-因为 Self-Attention 的本质就是"根据上下文决定关注什么"。你给模型的上下文里全是噪音，注意力就会分配给不该关注的地方；你给的上下文全是相关信息，注意力就能聚焦到正确的内容上。
-
-这就解释了为什么：
-
-- **模糊的 Prompt 效果差**：上下文里没有明确的关键信息，注意力被分散到无关内容上
-- **结构化的 Prompt 效果好**：清晰的结构让注意力更容易找到关键信息
-- **上下文里塞太多无关代码质量下降**：无关信息抢占了注意力，关键信息被稀释
-
-之前在 [Vibe Coding 面试题](原仓库Markdown/docs/interview/llm/vibe_coding_interview.md) 里讲过"上下文构建能力"，底层原理就在这——**你给的上下文质量直接决定了 Self-Attention 的效果，而 Self-Attention 决定了模型的输出质量**。
-
-**面试怎么说**："Self-Attention 的本质是让每个 Token 根据上下文动态调整自己的表示。
-
-Q 找相关词，K 判断匹配度，V 提供内容。
-
-这对应用开发的启示是：上下文质量决定注意力分配，注意力分配决定输出质量。所以我特别重视 Prompt 的结构化和上下文的精准性。"
-
----
-
-### 4. Multi-Head Attention：为什么要多个头？
-
-面试官会问："Multi-Head Attention 和 Self-Attention 什么关系？为什么要多个头？一个头不够吗？"
-
-#### 一个头的局限
-
-单头注意力只有一个 QKV 变换，只能学一种关系模式。
-
-但语言里的关系是多样的：
-
-- 语法关系："他吃饭"——"他"和"吃饭"是主谓关系
-- 指代关系："小明说他很开心"——"他"指代"小明"
-- 语义关系："苹果发布了新手机"——"苹果"是公司不是水果
-
-一个注意力头很难同时捕捉这么多种关系。
-
-#### 多头的解法
-
-Multi-Head Attention 就是把 QKV 复制多份，每份独立算注意力，每份学不同的关系模式。
-
-8 个头就像 8 个"视角"：
-
-- 第 1 个头关注语法结构
-- 第 2 个头关注指代关系
-- 第 3 个头关注语义相近的词
-- 第 4 个头关注位置相邻的词
-- ……
-
-最后把 8 个头的结果拼起来，综合判断。
-
-![Multi-Head Attention](https://file1.kamacoder.com/i/web/1778232934.png?v=20261005)
-
-**不是说模型被手动设计了这些分工，而是在训练过程中，不同的头自然学会了关注不同的关系模式。**
-
-#### 对应用开发的启示
-
-**为什么 Prompt 结构化比大段文字效果好？**
-
-因为多头注意力在处理结构化信息时效率更高。
-
-一段结构清晰的 Prompt：
-```
-目标：写一个退款接口
-参数：订单号、退款金额
-约束：幂等校验、部分退款上限50%
-上下文：orders表结构如下...
 ```
 
-每个注意力头可以快速定位到自己关注的部分——语法头看结构，语义头看关键词，指代头看参数对应关系。
+逐段理解。 Dimensions 保存统一配置；estimate 分别计算一层分数矩阵与所有层 K/V 的字节数；自检用实际小张量核对，并验证长度变化趋势。
 
-一段大段文字的 Prompt：
-```
-我需要你帮我写一个退款接口，参数有订单号和退款金额，要注意幂等校验，部分退款不能超过50%，orders表的结构是这样的...
-```
+### 这段代码怎么在面试里讲
 
-信息密度一样，但多头注意力在处理第二种格式时需要额外的计算来提取结构，效率更低。
+- 不变量：维度和每元素字节数为正；此例 GQA 要求查询头数为 KV 头数的整数倍。
 
-**结构化不是给人类看的，是给多头注意力看的。**
+- 关键过程：分数按 [B,Hq,T,T] 计数；缓存按 K/V、层、批次、KV 头、长度和头维计数。
 
-**面试怎么说**："Multi-Head Attention 让不同的头关注不同类型的关系——语法、语义、指代等。
+- 边界与坑：两个结果是理论张量大小，实际优化实现、碎片和模型权重会改变峰值；需要实测。
 
-这解释了为什么结构化的 Prompt 效果更好：每个头可以快速定位到相关部分，注意力分配更高效。
+### 本节收尾：费曼自述与闪卡
 
-我在实际开发中会刻意用结构化格式写 Prompt，就是为了让多头注意力更容易处理。"
+费曼自述： 注意力逻辑分数的形状随序列长度平方增长，KV 缓存随长度线性增长；实际显存受实现、权重和调度影响。
 
----
+- 问：KV 粗算用查询头数还是 KV 头数？答：KV 头数。
 
-### 5. Positional Encoding：为什么位置信息这么重要？
+- 问：T 加倍时完整分数张量元素数怎样变化？答：其他维度不变时变为四倍。
 
-面试官会问："Transformer 为什么需要位置编码？没有位置编码会怎样？"
+- 问：理论分数张量一定完整占用显存吗？答：不一定，优化内核可能不物化它。
 
-#### Transformer 天生没有顺序感
+- 问：单层分数与全层缓存相加就是峰值吗？答：不是，生命周期和其他开销也要考虑。
 
-这是很多人不知道的一个关键点：**Self-Attention 本身是完全不看顺序的。**
+### 原文核对 / 来源
 
-把"猫吃鱼"和"鱼吃猫"丢给 Self-Attention，没有位置编码的话，它的处理结果是一样的。因为注意力只看"哪些词之间有关系"，不看"谁在前面谁在后面"。
-
-但顺序对语言太重要了。"狗咬人"和"人咬狗"，词一样，意思完全相反。
-
-所以 Transformer 必须通过 Positional Encoding 把位置信息硬加进去，告诉模型"这个词在第几个位置"。
-
-#### 位置编码怎么加的？
-
-早期 Transformer 用的是正弦/余弦函数来编码位置，每个位置有一个独特的向量。现在的模型大多用可学习的位置编码——直接让模型在训练中学出每个位置该用什么向量。
-
-具体公式面试不用背，说清楚逻辑就行：**位置编码就是给每个 Token 打上一个"位置标签"，让模型知道这个词在句子的哪个位置。**
-
-#### 对应用开发的启示
-
-**为什么长上下文后面模型会"忘记"前面的内容？**
-
-位置编码有一个隐含的问题：**模型在训练时见过的位置范围是有限的。**
-
-如果一个模型训练时最长只见过 4096 个 Token 的文本，那它对第 5000 个位置的位置编码就没有学过。虽然可以通过外推（extrapolation）来处理更长的位置，但效果会下降。
-
-这就解释了：
-
-- **为什么上下文窗口有硬上限**：超出训练时见过的位置范围，位置编码就不可靠了
-- **为什么超长上下文质量会下降**：即使模型声称支持 200K 上下文，后半部分的注意力质量也不如前半部分
-- **为什么重要信息要放在 Prompt 开头或结尾**：模型对中间位置的信息关注度天然较低，这是所谓的"中间迷失"（Lost in the Middle）问题
-
-![中间迷失](https://file1.kamacoder.com/i/web/1778232935.png?v=20261005)
-
-关于上下文窗口的管理，之前在 [Claude Code 深度解析](原仓库Markdown/docs/interview/llm/claude_code_deep_dive.md) 里有详细讲 200K 窗口的管理策略，录友们可以翻翻。
-
-**面试怎么说**："Transformer 的 Self-Attention 本身没有顺序感，位置编码是硬加进去的。这意味着模型对位置的处理能力受限于训练时见过的位置范围。超长上下文质量下降、中间位置信息容易被忽略，都和位置编码有关。所以我在实际开发中会注意把关键信息放在上下文的开头或结尾，而不是塞在中间。"
-
----
-
-### 6. Encoder vs Decoder vs Decoder-Only：三大架构怎么选？
-
-面试官会问："GPT、BERT、T5 的架构有什么区别？为什么现在大模型都用 Decoder-Only？"
-
-这是 Transformer 架构最重要的分支，直接决定了模型能干什么、怎么用。
-
-#### 三大架构对比
-
-| 维度 | Encoder-Only | Encoder-Decoder | Decoder-Only |
-|------|-------------|-----------------|--------------|
-| 代表模型 | BERT | T5、BART | GPT、Claude、LLaMA |
-| 注意力方式 | 双向注意力 | Encoder 双向 + Decoder 单向 | 单向注意力（因果注意力） |
-| 能看到什么 | 整个输入 | Encoder 看全部，Decoder 只看前面 | 只看前面的 Token |
-| 擅长什么 | 理解、分类、抽取 | 翻译、摘要、转换 | 生成、对话、推理 |
-| 生成能力 | 弱 | 强 | 最强 |
-
-![三大架构对比](https://file1.kamacoder.com/i/web/1778232936.png?v=20261005)
-
-#### Encoder-Only：BERT 的路线
-
-BERT 用双向注意力，每个 Token 可以看到前面和后面所有的 Token。
-
-好处：理解能力强，做分类、实体识别、语义相似度这些任务效果很好。
-
-坏处：不能用来生成。因为生成必须是"看前面的词，预测下一个词"，双向注意力等于偷看了答案。
-
-BERT 在 2018 年很火，但后来大模型转向生成式，Encoder-Only 就不是主流了。
-
-#### Encoder-Decoder：T5 的路线
-
-Encoder 用双向注意力理解输入，Decoder 用单向注意力生成输出。
-
-典型的"理解了再写"模式，适合翻译、摘要这类输入和输出明确分离的任务。
-
-Google 的 T5 和 PaLM（部分版本）用这个架构。
-
-#### Decoder-Only：GPT 的路线
-
-只用单向注意力，每个 Token 只能看到前面的 Token，预测下一个 Token。
-
-这就是自回归生成：看前面的词，预测下一个词，再看前面的词（包括刚预测的），再预测下一个……一步步生成下去。
-
-![自回归生成](https://file1.kamacoder.com/i/web/1778232938.png?v=20261005)
-
-**为什么现在大模型都用 Decoder-Only？**
-
-三个原因：
-
-**① Scaling 效果最好**
-
-同样的参数量和数据量，Decoder-Only 在扩大规模时收益最大。GPT 系列从 1.17 亿参数到 1.8 万亿参数，效果持续提升。这不是偶然——Decoder-Only 的架构更简单统一，规模越大优势越明显。
-
-**② 生成和理解都能做**
-
-虽然 Decoder-Only 天然是生成式的，但通过 Prompt 设计，它也能做理解任务。反过来，Encoder-Only 就做不了生成。一专多能 > 只能做一样。
-
-**③ 训练更高效**
-
-Decoder-Only 每个位置的预测目标都是"下一个 Token"，训练目标统一。Encoder-Decoder 需要同时训练理解和生成两个部分，协调成本更高。
-
-#### 对应用开发的启示
-
-**为什么大模型都是"你给它一段文字，它接着往下写"的模式？**
-
-因为 Decoder-Only 的本质就是"给定前面的内容，预测下一个 Token"。你发一段 Prompt，模型就是在"续写"。对话、代码生成、问答，本质上都是续写。
-
-这就解释了：
-
-- **为什么 Prompt 的最后一句特别重要**：模型是接着你最后一句话往下写的，最后一句话的方向决定了生成方向
-- **为什么 Few-shot 有效**：给几个示例，模型就会"续写"出类似格式的内容
-- **为什么 System Prompt 要放在最前面**：最先出现的内容对整个生成过程都有影响，System Prompt 在开头相当于给"续写"定了基调
-
-**面试怎么说**："现在主流大模型都用 Decoder-Only，因为它 Scaling 效果最好、生成和理解都能做、训练更高效。这对应用开发的启示是：大模型的本质就是'续写'，Prompt 的结构和位置直接影响生成质量。System Prompt 放开头定基调，关键指令放结尾定方向，中间放上下文。"
-
----
-
-### 7. Transformer 的局限性
-
-面试官会问："Transformer 有什么问题？有没有解决思路？"
-
-Transformer 很强，但不是没有代价。了解这些局限性，才能在应用开发中做出更好的技术决策。
-
-#### 局限一：O(n²) 计算复杂度
-
-Self-Attention 的计算量和序列长度的平方成正比。序列长度翻一倍，计算量翻四倍。
-
-| 序列长度 | 注意力计算量 |
-|----------|-------------|
-| 1K Token | 100 万次 |
-| 2K Token | 400 万次 |
-| 4K Token | 1600 万次 |
-| 128K Token | 163 亿 |
-
-![O(n²) 复杂度](https://file1.kamacoder.com/i/web/1778232939.png?v=20261005)
-
-这就是为什么：
-
-- **Token 计费**：序列越长成本越高，不只是线性增长，是平方级增长
-- **上下文窗口不能无限大**：200K 上下文的注意力计算量已经是 40 亿级别，硬件扛不住更大了
-- **长对话越来越慢**：对话越长，每次新生成都要对全部历史做注意力计算
-
-对应用开发的启示：**控制上下文长度不只是省钱，是在控制计算复杂度。** 之前在 [Vibe Coding 面试题](原仓库Markdown/docs/interview/llm/vibe_coding_interview.md) 里讲的上下文管理策略，底层原因就在这。
-
-#### 局限二：位置编码的外推问题
-
-前面讲过，模型对训练时没见过的位置编码不可靠。即使做了长度外推优化，超长上下文的质量也会打折扣。
-
-目前的缓解方案：
-
-- **RoPE（旋转位置编码）**：目前主流方案，GPT-4、LLaMA 都在用，外推能力比正弦编码好
-- **YaRN / NTK-Aware**：通过调整频率来扩展位置编码的有效范围
-- **滑动窗口注意力**：不做全局注意力，只在局部窗口内算，牺牲一些全局信息换取更长的有效长度
-
-但这些都是缓解，不是根治。
-
-#### 局限三：中间迷失（Lost in the Middle）
-
-Transformer 对输入中间部分的信息关注度明显低于开头和结尾。
-
-无论模型多大、上下文多长，这个现象都存在。原因复杂，但和注意力分配机制有关——开头信息因为位置靠前，对所有后续 Token 都有影响；结尾信息因为距离生成位置最近，也天然获得更多关注。中间的信息两边都不靠，容易被忽略。
-
-对应用开发的启示：**关键信息别放在 Prompt 中间，放开头或结尾。**
-
-#### 局限四：生成是串行的
-
-Decoder-Only 模型生成 Token 是一个一个来的，第 N 个 Token 必须等前 N-1 个 Token 生成完。这种自回归特性决定了生成速度有上限。
-
-Speculative Decoding（投机解码）是一种加速方案：先用小模型快速生成几个候选 Token，再用大模型并行验证，对的留下、错的重新生成。但本质还是没改变串行生成的事实。
-
-对应用开发的启示：**生成比理解慢得多**，需要大量输出的场景要考虑流式返回。
-
-**面试怎么说**："Transformer 的核心局限是 O(n²) 的计算复杂度和位置编码的外推问题，这直接导致了上下文窗口有硬上限、Token 成本随长度平方级增长、长上下文中间信息容易被忽略。在应用开发中，我会通过上下文管理、关键信息前置、流式返回这些策略来应对。"
-
----
-
-### 8. 面试高频问题汇总
-
-#### 概念类
-
-**Q：Transformer 为什么能取代 RNN？**
-
-两个核心优势：① 全局建模——每个 Token 直接和所有其他 Token 建立关系，不需要像 RNN 一步步传递，解决了长距离依赖问题；② 并行计算——所有 Token 的注意力可以同时计算，不像 RNN 必须串行，训练速度快了几个数量级。
-
-**Q：Self-Attention 的 Q、K、V 分别是什么？**
-
-Q（Query）是当前词在找什么，K（Key）是每个词能提供什么，V（Value）是每个词的实际内容。注意力分数由 Q 和 K 的点积决定，输出由注意力分数加权 V 得到。通俗说：Q 找对象，K 判断匹不匹配，V 提供实际内容。
-
-**Q：为什么要 Multi-Head Attention？**
-
-单头注意力只能学一种关系模式，但语言里有多重关系——语法、语义、指代等。多头让不同的头关注不同类型的关系，最后综合判断。这就像从多个角度看同一件事，比只从一个角度看更全面。
-
-#### 架构类
-
-**Q：GPT、BERT、T5 的架构区别？**
-
-BERT 是 Encoder-Only，双向注意力，擅长理解不能生成。T5 是 Encoder-Decoder，Encoder 双向理解输入，Decoder 单向生成输出，适合翻译摘要。GPT 是 Decoder-Only，单向注意力，擅长生成，通过规模扩大也能做理解任务。现在主流用 Decoder-Only，因为 Scaling 效果最好。
-
-**Q：为什么现在大模型都用 Decoder-Only？**
-
-三个原因：① Scaling 效果最好——参数量和数据量越大，效果提升越稳定；② 生成和理解都能做——虽然天然是生成式，但通过 Prompt 也能做理解任务，而 Encoder-Only 做不了生成；③ 训练更高效——目标统一，就是预测下一个 Token。
-
-#### 应用类
-
-**Q：了解 Transformer 对应用开发有什么帮助？**
-
-差的回答："帮我理解模型的底层原理。"
-
-好的回答："直接帮助我做出更好的技术决策。O(n²) 复杂度让我知道为什么上下文管理那么重要；位置编码让我知道为什么长上下文质量会下降、关键信息要放开头或结尾；多头注意力让我知道为什么结构化 Prompt 效果更好；Decoder-Only 架构让我知道为什么 Prompt 末尾的指令特别重要。**不了解架构，优化只能靠试；了解架构，优化有据可依。**"
-
-**Q：Transformer 的 O(n²) 复杂度，在应用开发中怎么应对？**
-
-四个策略：控制上下文长度（只给相关代码，别把整个项目塞进去）、模型路由（长上下文场景用支持长窗口的大模型，短上下文用小模型省成本）、关键信息前置（避免中间迷失）、流式返回（生成阶段用流式缓解串行瓶颈）。核心思路是**在架构约束下做优化，而不是硬刚复杂度**。
-
-**Q：为什么 Prompt 末尾的指令对生成结果影响最大？**
-
-Decoder-Only 模型的生成本质是"续写"——接着你最后一个 Token 往下写。末尾的指令直接决定了续写的方向。开头的内容通过注意力影响整个生成过程，但末尾的指令距离生成位置最近，注意力权重天然更高。所以 System Prompt 放开头定基调，关键指令放结尾定方向，上下文放中间。
-
----
-
-### 写在最后
-
-回到开头的问题：**应用开发为什么要懂 Transformer？**
-
-因为 Transformer 的架构决定了大模型能做什么、不能做什么、擅长什么、弱在哪里。
-
-不懂架构，你用大模型只能靠经验"试"；懂了架构，你能从原理出发"推"。
-
-**Self-Attention 告诉你上下文质量为什么重要，多头注意力告诉你结构化 Prompt 为什么有效，位置编码告诉你长上下文为什么质量下降，O(n²) 复杂度告诉你 Token 成本为什么这么高。**
-
-这些不是理论，是你在开发中每天都会遇到的决策。
-
-加油
-
-**费曼自述：** 用自己做过的任务复述本节的核心追问，讲清基线、改动、评估指标和失败案例。
-
-**概念闪卡：** Q：面试回答为什么要给基线？A：否则无法证明改动有效。Q：没有亲手做过时如何回答？A：说明原理与验证计划，不编造项目指标。
-
-原文核对：[Transformer大厂面试题汇总：应用开发者视角](原仓库Markdown/docs/interview/llm/transformer_interview.md)。
+[原仓库 Transformer 面试题](原仓库Markdown/docs/interview/llm/transformer_interview.md)。
 
 ## 本章完成标准
 
